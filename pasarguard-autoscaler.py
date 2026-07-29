@@ -69,16 +69,15 @@ from install_pasarguard_node import (
 )
 
 # pasarguard-manager.py  (hyphenated filename — use importlib)
-_pg_mgr_spec = importlib.util.spec_from_file_location(
-    "pasarguard_manager",
-    str(MODULES_DIR / "pasarguard-manager.py"),
+from pasarguard_manager import (
+    _import_sdk,
+    _model_dump,
+    get_token,
 )
-_pg_mgr = importlib.util.module_from_spec(_pg_mgr_spec)
-_pg_mgr_spec.loader.exec_module(_pg_mgr)
 
-_pg_import_sdk = _pg_mgr._import_sdk
-_pg_model_dump = _pg_mgr._model_dump
-_pg_get_token = _pg_mgr.get_token
+_pg_import_sdk = _import_sdk
+_pg_model_dump = _model_dump
+_pg_get_token = get_token
 
 
 # ─────────────────────────────────────────────────────────────────────────────
