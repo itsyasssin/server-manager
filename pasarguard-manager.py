@@ -226,7 +226,7 @@ def build_parser() -> argparse.ArgumentParser:
     h_add.add_argument("--host", default=None, help="Host header(s), comma-separated")
     h_add.add_argument("--path", default=None, help="WebSocket path")
     h_add.add_argument("--security", default="inbound_default",
-                       choices=["inbound_default", "none", "tls"])"reality yahoo"
+                       choices=["inbound_default", "none", "tls"])
     h_add.add_argument("--alpn", default=None, help="ALPN(s), comma-separated (e.g. h2,http/1.1)")
     h_add.add_argument("--fingerprint", default="")
     h_add.add_argument("--allowinsecure", action="store_true", default=None)

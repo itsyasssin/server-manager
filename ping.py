@@ -22,6 +22,8 @@ import urllib.parse
 import urllib.error
 import logging
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+
 # ── Constants ────────────────────────────────────────────────────────────────
 
 API_BASE = "https://check-host.net"
