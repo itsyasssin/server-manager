@@ -8,13 +8,14 @@ with new Doprax VPS instances automatically.
 
 Workflow (every INTERVAL seconds):
   1. Fetch all enabled nodes from PasarGuard panel
-  2. Ping each node's address from Iran datacenters (check-host.net)
-  3. Find nodes where: success_rate < MINIMUM_RATING AND avg_ping > MINIMUM_PING
-  4. For the first failing node:
-     a. Find cheapest Doprax plan (VALID_COUNTRIES, VALID_DATACENTERS, < MINIMUM_BUDGET)
+  2. If active node count < MIN_NODES, provision new nodes up to MIN_NODES
+  3. Ping each node's address from Iran datacenters (check-host.net)
+  4. Find nodes where: success_rate < MINIMUM_RATING AND avg_ping > MINIMUM_PING
+  5. For the first failing node:
+     a. Find cheapest Doprax plan (VALID_COUNTRIES, VALID_DATACENTERS, <= MAX_BUDGET)
      b. Create VM, wait until active, get IP/username/password
      c. Ping the new VM from Iran
-     d. If new VM passes checks -> install PasarGuard, add to panel, disable old node
+     d. If new VM passes checks -> install PasarGuard, add to panel (with data_limit if plan has traffic cap), disable old node
      e. If new VM fails ping -> delete it, log, try different DC next cycle
 
 Usage:
@@ -35,6 +36,7 @@ import importlib.util
 import json
 import logging
 import os
+from random import shuffle
 import sys
 import time
 import uuid as _uuid
@@ -99,9 +101,15 @@ class AutoscalerConfig:
     # ── Doprax ──
     doprax_api_key: str = ""
     doprax_image: str = "ubuntu-22.04"
-    minimum_budget: float = 5.0             # max monthly price (USD)
+    max_budget: float = 5.0                  # max monthly price (USD)
     valid_countries: List[str] = field(default_factory=lambda: ["ir"])
     valid_datacenters: List[str] = field(default_factory=list)
+
+    # ── PasarGuard host defaults (used when adding new host to panel) ──
+    host_inbound_tag: str = ""
+
+    # ── Scaling ──
+    min_nodes: int = 1                       # minimum active nodes to maintain
 
     # ── PasarGuard Panel ──
     pasarguard_base_url: str = ""
@@ -170,7 +178,8 @@ def build_config(env_path: Optional[str] = None,
         minimum_ping=float(g("MINIMUM_PING", "200")),
         doprax_api_key=g("DOPRAX_API_KEY"),
         doprax_image=g("DOPRAX_IMAGE", "ubuntu-22.04"),
-        minimum_budget=float(g("MINIMUM_BUDGET", "5")),
+        max_budget=float(g("MAX_BUDGET", "5")),
+        min_nodes=int(g("MIN_NODES", "1")),
         valid_countries=_str_list(g("VALID_COUNTRIES", "ir")),
         valid_datacenters=_str_list(g("VALID_DATACENTERS", "")),
         pasarguard_base_url=g("PASARGUARD_BASE_URL"),
@@ -183,6 +192,7 @@ def build_config(env_path: Optional[str] = None,
         node_data_limit=int(g("PASARGUARD_NODE_DATA_LIMIT", "0")),
         node_default_timeout=int(g("PASARGUARD_NODE_DEFAULT_TIMEOUT", "10")),
         node_internal_timeout=int(g("PASARGUARD_NODE_INTERNAL_TIMEOUT", "15")),
+        host_inbound_tag=g("PASARGUARD_HOST_INBOUND_TAG", ""),
         state_file=state,
     )
 
@@ -243,6 +253,40 @@ def _doprax_get_plan_traffic(plan: Dict) -> str:
     return "NA"
 
 
+def _doprax_get_plan_traffic_bytes(plan: Dict) -> Optional[int]:
+    """Parse the plan's traffic/bandwidth string into bytes.
+
+    Handles formats like: '1 TB', '500GB', '1000 GB', 'Unlimited', 'NA', '0'.
+    Returns the integer byte count, or None if unlimited / not parseable.
+    """
+    import re as _re
+
+    raw = _doprax_get_plan_traffic(plan)
+    if not raw or raw.upper() in ("NA", "UNLIMITED", "UNLTD", "INF", "0"):
+        return None
+
+    # Normalise whitespace and case
+    text = raw.strip().upper().replace(" ", "")
+
+    # Regex: optional float + optional space + unit
+    m = _re.match(r"^(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|T|G|M|K|B)?$", text)
+    if not m:
+        logging.debug(f"Could not parse traffic string: '{raw}'")
+        return None
+
+    value = float(m.group(1))
+    unit = (m.group(2) or "B").upper()
+
+    multipliers = {
+        "TB": 1_099_511_627_776, "T": 1_099_511_627_776,
+        "GB": 1_073_741_824,      "G": 1_073_741_824,
+        "MB": 1_048_576,          "M": 1_048_576,
+        "KB": 1_024,             "K": 1_024,
+        "B":  1,
+    }
+    return int(value * multipliers.get(unit, 1))
+
+
 def doprax_find_plan(api_key: str, config: AutoscalerConfig,
                       exclude_datacenters: Optional[List[str]] = None) -> Optional[Dict]:
     """Find the cheapest matching Doprax plan.
@@ -250,11 +294,12 @@ def doprax_find_plan(api_key: str, config: AutoscalerConfig,
     Returns the raw plan dict or None.
     """
     exclude = set((d.lower() for d in (exclude_datacenters or [])))
-    max_cents = int(config.minimum_budget * 100)
+    exclude = set()
+    max_cents = int(config.max_budget * 100)
     countries = [c.lower() for c in config.valid_countries]
     dcs = [d.lower() for d in config.valid_datacenters]
 
-    plans = _doprax_mod.get_catalogue(api_key)
+    plans = _doprax_mod.get_catalogue(api_key, service_type="vm")
     matching = []
     for p in plans:
         plan_dc = _doprax_mod.get_plan_datacenter(p).lower()
@@ -262,7 +307,7 @@ def doprax_find_plan(api_key: str, config: AutoscalerConfig,
         monthly = _doprax_mod.extract_monthly_price_cents(p)
 
         # Filter
-        if monthly > max_cents:
+        if not monthly or monthly > max_cents:
             continue
         if countries and plan_country not in countries:
             continue
@@ -276,9 +321,38 @@ def doprax_find_plan(api_key: str, config: AutoscalerConfig,
     if not matching:
         return None
 
-    matching.sort(key=lambda p: _doprax_mod.extract_monthly_price_cents(p))
+    shuffle(matching)
+    # matching.sort(key=lambda p: _doprax_mod.extract_monthly_price_cents(p))
     return matching[0]
 
+
+async def pg_add_host(api, token: str, config: AutoscalerConfig,
+                      country: str, address: str) -> Optional[int]:
+    """Add a new host to the PasarGuard panel.
+
+    Args:
+        country: Country code (e.g., "ir", "de") - used as the host name
+        address: IP address of the node
+
+    Returns the new host ID or None.
+    """
+    pg = _pg_import_sdk()
+    host = pg.CreateHost(
+        remark=country,
+        address=[address],
+        security="inbound_default",
+        inbound_tag=config.host_inbound_tag if config.host_inbound_tag else None,
+        priority=1,
+    )
+    try:
+        result = await api.create_host(host=host, token=token)
+        result_dict = _pg_model_dump(result)
+        host_id = result_dict.get("id") or result_dict.get("host_id")
+        logging.info(f"Added new host '{country}' (address={address}) to panel, id={host_id}")
+        return host_id
+    except Exception as e:
+        logging.error(f"Failed to add host '{country}' to panel: {e}")
+        return None
 
 def doprax_create_vm(api_key: str, plan: Dict, image_hint: str,
                       name: str) -> Tuple[Optional[str], Optional[Dict]]:
@@ -287,19 +361,36 @@ def doprax_create_vm(api_key: str, plan: Dict, image_hint: str,
     Returns (None, None) on failure.
     """
     pv_id = plan["product_version_id"]
-    image_code = _doprax_mod.find_image_code(plan, image_hint)
-    if not image_code:
+    image_opt = _doprax_mod.find_image_option(plan, image_hint)
+    if not image_opt:
         logging.error(f"No image matching '{image_hint}' in plan")
         return None, None
+
+    # Build selections: both location AND operating system are chosen this
+    # way, each as {"optionId": "<uuid>"} — NOT via a top-level
+    # 'container_code' or a bare code string.
+    selections: Dict[str, Dict[str, str]] = {}
+    loc = _doprax_mod.get_plan_location_selection(plan)
+    if loc:
+        loc_key, loc_id = loc
+        selections[loc_key] = {"optionId": loc_id}
+    else:
+        logging.warning("No location option found in plan — VM creation will likely fail.")
+
+    img_key, img_id, _img_display = image_opt
+    selections[img_key] = {"optionId": img_id}
 
     body: Dict[str, Any] = {
         "product_version_id": pv_id,
         "idempotency_key": str(_uuid.uuid4()),
         "name": name,
-        "container_code": image_code,
+        "metadata": {"access_method": "password"},
     }
+    if selections:
+        body["selections"] = selections
 
     try:
+        print(body)
         resp = _doprax_mod.api_request("POST", "/api/v2/services/instances/", api_key, body=body)
     except Exception as e:
         logging.error(f"Doprax create VM failed: {e}")
@@ -307,7 +398,6 @@ def doprax_create_vm(api_key: str, plan: Dict, image_hint: str,
 
     data = resp.get("data") or {}
 
-    # Extract service_id from various possible locations
     service_id = (
         data.get("service_id")
         or data.get("id")
@@ -318,7 +408,6 @@ def doprax_create_vm(api_key: str, plan: Dict, image_hint: str,
         return None, resp
 
     return str(service_id), resp
-
 
 def doprax_wait_vm_ready(api_key: str, service_id: str,
                           timeout: int = 300, interval: int = 10) -> Optional[Dict]:
@@ -467,11 +556,17 @@ async def pg_list_nodes(api, token: str) -> List[Dict[str, Any]]:
 
 async def pg_add_node(api, token: str, config: AutoscalerConfig,
                       name: str, address: str, port: str,
-                      api_key: str, certificate: str) -> Optional[int]:
+                      api_key: str, certificate: str,
+                      data_limit: Optional[int] = None) -> Optional[int]:
     """Add a new node to the PasarGuard panel.
+
+    Args:
+        data_limit: Override for the node's data limit in bytes.
+            If None, falls back to config.node_data_limit.
 
     Returns the new node ID or None.
     """
+    effective_data_limit = data_limit if data_limit is not None else config.node_data_limit
     pg = _pg_import_sdk()
     node = pg.NodeCreate(
         name=name,
@@ -484,7 +579,7 @@ async def pg_add_node(api, token: str, config: AutoscalerConfig,
         core_config_id=config.node_core_config_id,
         api_key=api_key,
         usage_coefficient=config.node_usage_coefficient,
-        data_limit=config.node_data_limit,
+        data_limit=effective_data_limit,
         default_timeout=config.node_default_timeout,
         internal_timeout=config.node_internal_timeout,
     )
@@ -550,6 +645,17 @@ async def pg_disable_node(api, token: str, node_id: int) -> bool:
 # Node naming
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _effective_node_count(nodes: List[Dict], state: Dict) -> int:
+    """Count nodes that should be considered 'active' for MIN_NODES check.
+
+    Enabled nodes from the panel are always counted.  Nodes that were
+    replaced in this session are also counted (the replacement is
+    already enabled in the panel, so this is usually a no-op, but it
+    protects against timing gaps between replace-and-reread).
+    """
+    return len(nodes)
+
+
 def build_node_name(datacenter: str, plan: Dict) -> str:
     """Build node name: datacenter + budget + free traffic.
 
@@ -571,6 +677,162 @@ def build_node_name(datacenter: str, plan: Dict) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 # Main orchestration
 # ─────────────────────────────────────────────────────────────────────────────
+
+async def _provision_new_node(
+    config: AutoscalerConfig,
+    state: Dict[str, Any],
+) -> bool:
+    """Provision a brand-new PasarGuard node on Doprax (scale-up, no old node to disable).
+
+    Returns True if provisioning succeeded.
+    """
+    logging.info("=== Provisioning new node (scale-up) ===")
+
+    exclude_dcs = list(state.get("failed_datacenters", {}).keys())
+    plan = doprax_find_plan(config.doprax_api_key, config, exclude_datacenters=exclude_dcs)
+    if not plan:
+        logging.warning("No matching Doprax plan found for scale-up. Will retry next cycle.")
+        return False
+
+    dc = _doprax_mod.get_plan_datacenter(plan)
+    traffic = _doprax_get_plan_traffic(plan)
+    monthly_cents = _doprax_mod.extract_monthly_price_cents(plan)
+    new_node_name = build_node_name(dc, plan)
+    traffic_bytes = _doprax_get_plan_traffic_bytes(plan)
+
+    logging.info(
+        f"Selected plan: dc={dc}, ${monthly_cents/100:.2f}/mo, traffic={traffic}, name='{new_node_name}'"
+    )
+
+    if config.dry_run:
+        logging.info("[DRY-RUN] Would create Doprax VM and provision new node.")
+        return True
+
+    # Create VM
+    service_id, create_resp = doprax_create_vm(
+        config.doprax_api_key, plan, config.doprax_image, new_node_name
+    )
+    if not service_id:
+        logging.error("Failed to create Doprax VM for scale-up.")
+        return False
+
+    logging.info(f"Doprax VM created: service_id={service_id}")
+    create_data = (create_resp or {}).get("data") or {}
+    op_id = create_data.get("operation_id")
+    if op_id:
+        _doprax_mod._poll_operation(config.doprax_api_key, op_id, max_wait=config.vm_ready_timeout)
+
+    # Wait for VM ready
+    detail = doprax_wait_vm_ready(
+        config.doprax_api_key, service_id,
+        timeout=config.vm_ready_timeout,
+        interval=config.vm_ready_poll_interval,
+    )
+    if not detail:
+        logging.error(f"VM {service_id} did not become active. Cleaning up...")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+    # Get access
+    access = doprax_extract_access(detail)
+    if not access or not access["ip"]:
+        logging.error(f"Could not extract access info for VM {service_id}")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+    new_ip = access["ip"]
+    new_user = access["username"]
+    vm_code = detail.get("vm", {}).get("vm_code", "")
+    new_pass = _doprax_mod.get_password(config.doprax_api_key, vm_code)
+    if not new_pass:
+        logging.error(f"Could not get password for VM {service_id}")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+    logging.info(f"VM ready: {new_user}@{new_ip}")
+
+    # Ping check
+    logging.info(f"Pinging new VM {new_ip} from Iran...")
+    rate, avg_ms = ping_host(new_ip, timeout=config.ping_poll_timeout)
+    logging.info(f"New VM ping results: rate={rate:.1f}%, avg={avg_ms:.1f}ms" if avg_ms else f"rate={rate:.1f}%, avg=N/A")
+
+    if rate < config.minimum_rating or (avg_ms is not None and avg_ms > config.minimum_ping):
+        logging.warning(
+            f"New VM {new_ip} fails checks (rate={rate:.1f}%<{config.minimum_rating}%, "
+            f"ping={avg_ms}>{config.minimum_ping}ms). Deleting VM and marking DC as bad."
+        )
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        state.setdefault("failed_datacenters", {})[dc] = datetime.now(timezone.utc).isoformat()
+        _save_state(config.state_file, state)
+        return False
+
+    # Install PasarGuard
+    logging.info(f"Installing PasarGuard node on {new_user}@{new_ip}...")
+    if not new_pass:
+        logging.error("No password available for SSH. Cannot install node.")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+    creds = SSHCredentials(host=new_ip, username=new_user, password=new_pass)
+    try:
+        install_result: NodeInstallResult = _install_pg_node(creds)
+    except Exception as e:
+        logging.error(f"PasarGuard node install failed: {e}")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+    logging.info(
+        f"PasarGuard node installed: api_key={install_result.api_key[:8]}..., port={install_result.port}, "
+        f"cert={'yes' if install_result.certificate else 'no'}"
+    )
+
+    # Add to panel (with data_limit from plan if available)
+    pg_api, pg_token = await pg_login(config)
+    new_pg_node_id = await pg_add_node(
+        pg_api, pg_token, config,
+        name=new_node_name,
+        address=new_ip,
+        port=install_result.port,
+        api_key=install_result.api_key,
+        certificate=install_result.certificate,
+        data_limit=traffic_bytes,
+    )
+    if not new_pg_node_id:
+        logging.error("Failed to add new node to PasarGuard panel. Aborting.")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+
+
+
+    if not new_pg_node_id:
+        logging.error("Failed to add new node to PasarGuard panel. Aborting.")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+    # Add host to panel with country as name
+    country = _doprax_mod.get_plan_country(plan)
+    if country and config.host_inbound_tag:
+        host_id = await pg_add_host(pg_api, pg_token, config, country=country, address=new_ip)
+        if not host_id:
+            logging.warning(f"Failed to add host for country '{country}'. Node still added.")
+    elif not config.host_inbound_tag:
+        logging.debug("No PASARGUARD_HOST_INBOUND_TAG set, skipping host creation.")
+
+    # Update state
+    state.setdefault("provisioned_nodes", []).append({
+        "node_name": new_node_name,
+        "node_id": new_pg_node_id,
+        "address": new_ip,
+        "doprax_service_id": service_id,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    })
+    state["stats"]["provisions"] = state["stats"].get("provisions", 0) + 1
+    state["failed_datacenters"] = {}
+    _save_state(config.state_file, state)
+
+    logging.info(f"=== Scale-up complete: new node '{new_node_name}' ({new_ip}) ===")
+    return True
+
 
 async def _replace_failing_node(
     failing_node: Dict[str, Any],
@@ -598,9 +860,11 @@ async def _replace_failing_node(
     traffic = _doprax_get_plan_traffic(plan)
     monthly_cents = _doprax_mod.extract_monthly_price_cents(plan)
     new_node_name = build_node_name(dc, plan)
+    traffic_bytes = _doprax_get_plan_traffic_bytes(plan)
 
     logging.info(
         f"Selected plan: dc={dc}, ${monthly_cents/100:.2f}/mo, traffic={traffic}, name='{new_node_name}'"
+        + (f", data_limit={traffic_bytes} bytes" if traffic_bytes else "")
     )
 
     if config.dry_run:
@@ -644,7 +908,14 @@ async def _replace_failing_node(
 
     new_ip = access["ip"]
     new_user = access["username"]
-    new_pass = access["password"]
+    vm_code = detail.get("vm_code", "")
+    new_pass = _doprax_mod.get_password(config.doprax_api_key, vm_code)
+    if not new_pass:
+        logging.error(f"Could not get password for VM {service_id}")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+    # new_pass = access["password"]
     logging.info(f"VM ready: {new_user}@{new_ip}")
 
     # ── 5. Ping the new VM from Iran ──
@@ -683,7 +954,7 @@ async def _replace_failing_node(
         f"cert={'yes' if install_result.certificate else 'no'}"
     )
 
-    # ── 7. Add new node to PasarGuard panel ──
+    # ── 7. Add new node to PasarGuard panel (with data_limit from plan if capped) ──
     pg_api, pg_token = await pg_login(config)
     new_pg_node_id = await pg_add_node(
         pg_api, pg_token, config,
@@ -692,11 +963,27 @@ async def _replace_failing_node(
         port=install_result.port,
         api_key=install_result.api_key,
         certificate=install_result.certificate,
+        data_limit=traffic_bytes,
     )
     if not new_pg_node_id:
         logging.error("Failed to add new node to PasarGuard panel. Aborting.")
         doprax_delete_vm(config.doprax_api_key, service_id)
         return False
+
+
+    if not new_pg_node_id:
+        logging.error("Failed to add new node to PasarGuard panel. Aborting.")
+        doprax_delete_vm(config.doprax_api_key, service_id)
+        return False
+
+    # Add host to panel with country as name
+    country = _doprax_mod.get_plan_country(plan)
+    if country and config.host_inbound_tag:
+        host_id = await pg_add_host(pg_api, pg_token, config, country=country, address=new_ip)
+        if not host_id:
+            logging.warning(f"Failed to add host for country '{country}'. Node still added.")
+    elif not config.host_inbound_tag:
+        logging.debug("No PASARGUARD_HOST_INBOUND_TAG set, skipping host creation.")
 
     # ── 8. Disable old failing node ──
     logging.info(f"Disabling old node {node_id} ('{node_name}')...")
@@ -744,14 +1031,36 @@ async def run_one_cycle(config: AutoscalerConfig, state: Dict[str, Any]) -> None
         _save_state(config.state_file, state)
         return
 
+    active_count = len(nodes)
+    logging.info(f"Found {active_count} enabled node(s) in PasarGuard panel.")
+
+    # ── 2. Scale up if below MIN_NODES ──
+    if active_count < config.min_nodes:
+        needed = config.min_nodes - active_count
+        logging.info(
+            f"Active nodes ({active_count}) < MIN_NODES ({config.min_nodes}). "
+            f"Need to provision {needed} more node(s)."
+        )
+        # Provision one per cycle to keep things stable
+        success = await _provision_new_node(config, state)
+        if not success:
+            state["stats"]["failures"] = state["stats"].get("failures", 0) + 1
+        _save_state(config.state_file, state)
+        # Re-fetch nodes after provisioning so the ping-check below sees the new node
+        try:
+            pg_api, pg_token = await pg_login(config)
+            nodes = await pg_list_nodes(pg_api, pg_token)
+            active_count = len(nodes)
+            logging.info(f"After scale-up: {active_count} enabled node(s).")
+        except Exception:
+            pass
+
     if not nodes:
-        logging.info("No enabled nodes found in PasarGuard panel. Nothing to check.")
+        logging.info("No enabled nodes found. Nothing to ping-check.")
         _save_state(config.state_file, state)
         return
 
-    logging.info(f"Found {len(nodes)} enabled node(s) in PasarGuard panel.")
-
-    # ── 2. Ping each node and find failing ones ──
+    # ── 3. Ping each node and find failing ones ──
     failing_nodes = []
     for node in nodes:
         addr = node.get("address", "")
@@ -771,7 +1080,7 @@ async def run_one_cycle(config: AutoscalerConfig, state: Dict[str, Any]) -> None
         avg_str = f"{avg_ms:.1f}ms" if avg_ms is not None else "N/A"
         logging.info(f"  '{nname}': rate={rate:.1f}%, avg_ping={avg_str}")
 
-        if rate < config.minimum_rating and (avg_ms is None or avg_ms > config.minimum_ping):
+        if rate < config.minimum_rating or (avg_ms is None or avg_ms > config.minimum_ping):
             logging.warning(
                 f"  '{nname}' FAILS thresholds: rate={rate:.1f}%<{config.minimum_rating}%, "
                 f"ping={avg_str}>{config.minimum_ping}ms"
@@ -780,7 +1089,7 @@ async def run_one_cycle(config: AutoscalerConfig, state: Dict[str, Any]) -> None
         else:
             logging.info(f"  '{nname}' passes thresholds.")
 
-    # ── 3. Replace first failing node (one per cycle to avoid chaos) ──
+    # ── 4. Replace first failing node (one per cycle to avoid chaos) ──
     if not failing_nodes:
         logging.info("All nodes pass thresholds. No action needed.")
         _save_state(config.state_file, state)
@@ -816,7 +1125,7 @@ def main() -> None:
 
     # ── Setup logging ──
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.DEBUG,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
@@ -834,6 +1143,9 @@ def main() -> None:
         errors.append("PASARGUARD_BASE_URL is not set")
     if not config.pasarguard_username:
         errors.append("PASARGUARD_ADMIN_USERNAME is not set")
+    if not config.host_inbound_tag:
+        errors.append("PASARGUARD_HOST_INBOUND_TAG is not set")
+
     if not config.pasarguard_password:
         errors.append("PASARGUARD_ADMIN_PASSWORD is not set")
     if errors:
@@ -843,10 +1155,12 @@ def main() -> None:
         sys.exit(1)
 
     logging.info("PasarGuard Autoscaler starting...")
+    logging.info(f"  Host inbound tag: {config.host_inbound_tag or '(not set - hosts will not be created)'}")
     logging.info(f"  Interval: {config.interval}s")
     logging.info(f"  Min rating: {config.minimum_rating}%")
     logging.info(f"  Max ping: {config.minimum_ping}ms")
-    logging.info(f"  Max budget: ${config.minimum_budget}/mo")
+    logging.info(f"  Max budget: ${config.max_budget}/mo")
+    logging.info(f"  Min nodes: {config.min_nodes}")
     logging.info(f"  Countries: {config.valid_countries}")
     logging.info(f"  Datacenters: {config.valid_datacenters or '(any)'}")
     logging.info(f"  Dry run: {config.dry_run}")

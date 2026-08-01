@@ -162,6 +162,8 @@ def install_node(
             if cert_exit == 0:
                 certificate = cert_out.strip()
 
+        certificate = certificate.replace("\r", "")
+
         return NodeInstallResult(
             api_key=api_key,
             port=port,

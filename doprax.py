@@ -49,6 +49,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from random import shuffle
 import sys
 import time
 import urllib.request
@@ -62,26 +63,44 @@ BASE_URL = "https://www.doprax.com"
 
 
 # ── HTTP helper ──────────────────────────────────────────────────────────────
-
 def api_request(method: str, path: str, api_key: str,
-                body: dict | None = None, query: dict | None = None) -> dict:
-    """Make an authenticated API request and return parsed JSON."""
+                body: dict | None = None, query: dict | None = None,
+                proxy: str | None = None) -> dict:
+
     url = f"{BASE_URL}{path}"
+
     if query:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(query)
 
     data = json.dumps(body).encode() if body else None
+
     headers = {
         "Content-Type": "application/json",
         "Accept": "application/json",
-        "X-API-Key": api_key,              # OpenAPI: ApiKeyAuth -> header X-API-Key
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0",
+        "X-API-Key": api_key,
+        "User-Agent": "Mozilla/5.0",
     }
-    req = urllib.request.Request(url, data=data, method=method, headers=headers)
+
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method=method,
+        headers=headers
+    )
+    proxy = "socks5://me.computer:10809"
+
+    if proxy:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({
+                "http": proxy,
+                "https": proxy,
+            })
+        )
+        with opener.open(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
 
     with urllib.request.urlopen(req, timeout=30) as resp:
         return json.loads(resp.read().decode())
-
 
 def _all_pages(api_key: str, path: str,
                query: dict | None = None) -> tuple[list[dict], dict]:
@@ -111,6 +130,11 @@ def _all_pages(api_key: str, path: str,
 
 # ── Catalogue helpers ────────────────────────────────────────────────────────
 
+def get_password(api_key: str, vm_code: str) -> str:
+    resp = api_request("GET", f"/api/v2/vms/{vm_code}/actions/access/", api_key)
+    return resp.get("data", {}).get("tempPass")
+
+
 def get_catalogue(api_key: str, service_type: str | None = None,
                   provider: str | None = None) -> list[dict]:
     """Fetch the service catalogue.
@@ -135,7 +159,8 @@ def extract_monthly_price_cents(plan: dict) -> int:
     total = 0
     for pc in plan.get("price_components") or []:
         bu = (pc.get("billing_unit") or "").lower()
-        if bu in ("month", "monthly", "mo"):
+        code = pc.get("code", "")
+        if bu in ("month", "monthly", "mo") and code == "base_plan":
             total += pc.get("unit_price_cents", 0)
     return total
 
@@ -164,6 +189,21 @@ def get_plan_locations(plan: dict) -> list[dict]:
     return locs
 
 
+def get_option_id(opt: dict) -> str | None:
+    """Extract the UUID identifier from an allowed_options entry.
+
+    The 'selections' field in the create-VM request needs the option's UUID
+    (wrapped as {"optionId": "<uuid>"}), NOT the human-readable 'code'
+    (e.g. "ir-thr"). Different catalogue entries have been observed using
+    different key names for this id, so we try the common variants.
+    """
+    for key in ("id", "option_id", "optionId", "uuid", "value"):
+        val = opt.get(key)
+        if val:
+            return val
+    return None
+
+
 def get_plan_country(plan: dict) -> str:
     """Get the 2-letter country code from a plan's location options."""
     for _, opt in _extract_all_options(plan):
@@ -181,17 +221,16 @@ def get_plan_country(plan: dict) -> str:
 
 def get_plan_datacenter(plan: dict) -> str:
     """Get the first datacenter/region code from a plan."""
-    for opt_key, opt in _extract_all_options(plan):
-        if "location" in opt_key.lower() or "region" in opt_key.lower() or "datacenter" in opt_key.lower():
-            return opt.get("code", "")
-    return ""
+    return plan.get("provider", {}).get("code", "")
 
+def find_image_option(plan: dict, image_hint: str) -> tuple[str, str, str] | None:
+    """Find an OS/image option matching the hint (case-insensitive substring match).
 
-def find_image_code(plan: dict, image_hint: str) -> str | None:
-    """Find an option code matching the image hint (case-insensitive substring match).
+    Searches all allowed_options for image/os/system related option groups
+    (e.g. 'operating_system').
 
-    Searches all allowed_options for image/os related keys.
-    Returns the option 'code' to use as container_code in the create request.
+    Returns (opt_key, option_id, display_code) for use in the 'selections'
+    field of the create request, or None if nothing matched.
     """
     hint = image_hint.lower()
     for opt_key, opt in _extract_all_options(plan):
@@ -201,8 +240,21 @@ def find_image_code(plan: dict, image_hint: str) -> str | None:
         code = opt.get("code", "")
         label = opt.get("label", "")
         if hint in code.lower() or hint in label.lower():
-            return code
+            opt_id = get_option_id(opt)
+            if not opt_id:
+                continue
+            return (opt_key, opt_id, code or label)
     return None
+
+
+def find_image_code(plan: dict, image_hint: str) -> str | None:
+    """Deprecated: kept for backward compatibility. Returns the display code only.
+
+    Use find_image_option() instead when building the 'selections' payload,
+    since the API needs the option's UUID, not this human-readable code.
+    """
+    result = find_image_option(plan, image_hint)
+    return result[2] if result else None
 
 
 def match_plan(plan: dict, countries: list[str] | None,
@@ -302,6 +354,23 @@ def cmd_catalogue(api_key: str, args) -> None:
     print(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
+def get_plan_location_selection(plan: dict) -> tuple[str, str] | None:
+    """Get the location option key and UUID for the 'selections' field.
+
+    Returns (option_key, option_id) — e.g. ("location", "ec5bc1aa-db5f-...") —
+    for direct use as selections[option_key] = {"optionId": option_id}.
+    Returns None if no location option (with a resolvable id) exists.
+    """
+    all_location = []
+    for opt_key, opt in _extract_all_options(plan):
+        if "location" in opt_key.lower() or "region" in opt_key.lower() or "datacenter" in opt_key.lower():
+            opt_id = get_option_id(opt)
+            if opt_id:
+                all_location.append((opt_key, opt_id))
+
+    shuffle(all_location)
+    return all_location[0] if all_location else None
+
 def cmd_add(api_key: str, args) -> None:
     """Smart-add: find the cheapest matching plan and create a VM.
 
@@ -336,14 +405,14 @@ def cmd_add(api_key: str, args) -> None:
 
     # 4. Find first plan with a matching OS image (if --image given)
     chosen_plan = None
-    chosen_image_code = None
+    chosen_image_option = None  # (opt_key, option_id, display_code)
 
     for plan in matching:
         if args.image:
-            img_code = find_image_code(plan, args.image)
-            if not img_code:
+            img_opt = find_image_option(plan, args.image)
+            if not img_opt:
                 continue
-            chosen_image_code = img_code
+            chosen_image_option = img_opt
         chosen_plan = plan
         break
 
@@ -362,8 +431,8 @@ def cmd_add(api_key: str, args) -> None:
     print(f"    Provider  : {provider}")
     print(f"    Datacenter: {dc or '(unknown)'}")
     print(f"    Price     : ${monthly / 100:.2f}/mo")
-    if chosen_image_code:
-        print(f"    Image     : {chosen_image_code}")
+    if chosen_image_option:
+        print(f"    Image     : {chosen_image_option[2]}")
 
     if not args.yes:
         confirm = input("\n[?] Create this VM? [y/N] ").strip().lower()
@@ -371,16 +440,34 @@ def cmd_add(api_key: str, args) -> None:
             print("Aborted.")
             sys.exit(0)
 
-    # 5. Build create request per OpenAPI spec
+    # 5. Build create request per OpenAPI spec.
+    # NOTE: both location AND operating system are chosen via 'selections',
+    # each as {"optionId": "<uuid>"} — NOT via a top-level 'container_code'
+    # or a bare code string.
     body: dict = {
-        "product_version_id": pv_id,        # required, uuid
-        "idempotency_key": str(_uuid.uuid4()),  # required, non-empty
+        "product_version_id": pv_id,
+        "idempotency_key": str(_uuid.uuid4()),
         "name": args.name,
+        "metadata": {"access_method": "password"},
     }
     if args.description:
         body["description"] = args.description
-    if chosen_image_code:
-        body["container_code"] = chosen_image_code
+
+    selections: dict = {}
+
+    loc = get_plan_location_selection(chosen_plan)
+    if loc:
+        opt_key, opt_id = loc
+        selections[opt_key] = {"optionId": opt_id}
+    else:
+        print("[WARNING] No location option found in plan — VM creation will likely fail.")
+
+    if chosen_image_option:
+        opt_key, opt_id, _display = chosen_image_option
+        selections[opt_key] = {"optionId": opt_id}
+
+    if selections:
+        body["selections"] = selections
 
     print(f"\n[*] Creating VM '{args.name}' ...")
     resp = api_request("POST", "/api/v2/services/instances/", api_key, body=body)
