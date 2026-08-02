@@ -108,6 +108,9 @@ def api_request(
     except requests.JSONDecodeError:
         print(resp.text)
         return {}
+    except:
+        logging.exception("Unexpected error")
+        return {}
 
 def _all_pages(api_key: str, path: str,
                query: dict | None = None) -> tuple[list[dict], dict]:
