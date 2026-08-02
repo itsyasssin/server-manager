@@ -97,8 +97,8 @@ def _connect(creds: SSHCredentials) -> paramiko.SSHClient:
         port=creds.port,
         username=creds.username,
         password=creds.password,
-        key_filename=creds.key_filename,
-        passphrase=creds.key_passphrase,
+        # key_filename=creds.key_filename,
+        # passphrase=creds.key_passphrase,
         timeout=30,
     )
     return client

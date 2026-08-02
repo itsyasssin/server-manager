@@ -58,6 +58,7 @@ import time
 import urllib.request
 import urllib.error
 import urllib.parse
+import requests
 import uuid as _uuid
 
 # ── Constants ────────────────────────────────────────────────────────────────
@@ -66,55 +67,47 @@ BASE_URL = "https://www.doprax.com"
 
 
 # ── HTTP helper ──────────────────────────────────────────────────────────────
-def api_request(method: str, path: str, api_key: str,
-                body: dict | None = None, query: dict | None = None,
-                proxy: str | None = None) -> dict:
 
+def api_request(
+    method: str,
+    path: str,
+    api_key: str,
+    body: dict | None = None,
+    query: dict | None = None,
+    proxy: str | None = None,
+) -> dict:
     url = f"{BASE_URL}{path}"
 
-    if query:
-        url += ("&" if "?" in url else "?") + urllib.parse.urlencode(query)
-
-    data = json.dumps(body).encode() if body else None
-
     headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
         "X-API-Key": api_key,
+        "Accept": "application/json",
         "User-Agent": "Mozilla/5.0",
     }
 
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method=method,
-        headers=headers
-    )
-    # proxy = "socks5://me.computer:10809"
-
+    proxies = None
     if proxy:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({
-                "http": proxy,
-                "https": proxy,
-            })
-        )
-        with opener.open(req, timeout=60) as resp:
-            content = resp.read().decode()
-            try:
-                return json.loads(content)
-            except json.JSONDecodeError:
-                print(f"Failed to decode JSON: {content}")
-                return {}
+        proxies = {
+            "http": proxy,
+            "https": proxy,
+        }
 
-    with urllib.request.urlopen(req, timeout=50) as resp:
-        content = resp.read().decode()
-        try:
-            return json.loads(content)
-        except json.JSONDecodeError:
-            print(f"Failed to decode JSON: {content}")
-            return {}
+    resp = requests.request(
+        method=method,
+        url=url,
+        params=query,
+        json=body,
+        headers=headers,
+        proxies=proxies,
+        timeout=60,
+    )
 
+    resp.raise_for_status()
+
+    try:
+        return resp.json()
+    except requests.JSONDecodeError:
+        print(resp.text)
+        return {}
 
 def _all_pages(api_key: str, path: str,
                query: dict | None = None) -> tuple[list[dict], dict]:
