@@ -110,6 +110,7 @@ class AutoscalerConfig:
 
     # ── Scaling ──
     min_nodes: int = 1                       # minimum active nodes to maintain
+    max_create_retries: int = 3              # retries when creating/replacing a VM
 
     # ── PasarGuard Panel ──
     pasarguard_base_url: str = ""
@@ -180,6 +181,7 @@ def build_config(env_path: Optional[str] = None,
         doprax_image=g("DOPRAX_IMAGE", "ubuntu-22.04"),
         max_budget=float(g("MAX_BUDGET", "5")),
         min_nodes=int(g("MIN_NODES", "1")),
+        max_create_retries=int(g("MAX_CREATE_RETRIES", "3")),
         valid_countries=_str_list(g("VALID_COUNTRIES", "ir")),
         valid_datacenters=_str_list(g("VALID_DATACENTERS", "")),
         pasarguard_base_url=g("PASARGUARD_BASE_URL"),
@@ -680,6 +682,128 @@ def build_node_name(datacenter: str, plan: Dict) -> str:
 # Main orchestration
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _mark_dc_failed(config: AutoscalerConfig, state: Dict[str, Any], dc: str) -> None:
+    """Record a datacenter as bad in state so later attempts pick a different one."""
+    state.setdefault("failed_datacenters", {})[dc] = datetime.now(timezone.utc).isoformat()
+    _save_state(config.state_file, state)
+
+
+def _cleanup_failed_vm(config: AutoscalerConfig, service_id: str,
+                       state: Dict[str, Any], dc: str) -> None:
+    """Delete a failed VM and mark its datacenter as bad."""
+    doprax_delete_vm(config.doprax_api_key, service_id)
+    _mark_dc_failed(config, state, dc)
+
+
+def _create_validated_vm(config: AutoscalerConfig,
+                         state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Create a Doprax VM and validate it (ready + ping from Iran).
+
+    Retries up to config.max_create_retries times. Each failed attempt deletes
+    the VM and marks its datacenter as bad so the next attempt selects a
+    different plan/DC. Returns a dict with the validated VM info on success,
+    or None once all attempts are exhausted.
+    """
+    for attempt in range(1, config.max_create_retries + 1):
+        logging.info(f"--- VM create attempt {attempt}/{config.max_create_retries} ---")
+
+        # Pick a plan, excluding datacenters already proven bad
+        exclude_dcs = list(state.get("failed_datacenters", {}).keys())
+        plan = doprax_find_plan(config.doprax_api_key, config, exclude_datacenters=exclude_dcs)
+        if not plan:
+            logging.warning("No matching Doprax plan found. Giving up.")
+            return None
+
+        dc = _doprax_mod.get_plan_datacenter(plan)
+        monthly_cents = _doprax_mod.extract_monthly_price_cents(plan)
+        new_node_name = build_node_name(dc, plan)
+        logging.info(
+            f"Selected plan: dc={dc}, ${monthly_cents/100:.2f}/mo, "
+            f"traffic={_doprax_get_plan_traffic(plan)}, name='{new_node_name}'"
+        )
+
+        service_id = None
+        try:
+            # Create VM
+            service_id, create_resp = doprax_create_vm(
+                config.doprax_api_key, plan, config.doprax_image, new_node_name
+            )
+            if not service_id:
+                logging.error(f"Failed to create Doprax VM (attempt {attempt}).")
+                continue
+
+            logging.info(f"Doprax VM created: service_id={service_id}")
+            create_data = (create_resp or {}).get("data") or {}
+            op_id = create_data.get("operation_id")
+            if op_id:
+                _doprax_mod._poll_operation(config.doprax_api_key, op_id, max_wait=config.vm_ready_timeout)
+
+            # Wait for VM ready
+            detail = doprax_wait_vm_ready(
+                config.doprax_api_key, service_id,
+                timeout=config.vm_ready_timeout,
+                interval=config.vm_ready_poll_interval,
+            )
+            if not detail:
+                logging.error(f"VM {service_id} did not become active. Cleaning up and retrying...")
+                _cleanup_failed_vm(config, service_id, state, dc)
+                continue
+
+            # Get access (IP, username, password)
+            access = doprax_extract_access(detail)
+            if not access or not access["ip"]:
+                logging.error(f"Could not extract access info for VM {service_id}. Cleaning up and retrying...")
+                _cleanup_failed_vm(config, service_id, state, dc)
+                continue
+
+            new_ip = access["ip"]
+            new_user = access["username"]
+            vm_code = (
+                (detail.get("vm") or {}).get("vm_code", "")
+                or (detail.get("links") or {}).get("vm_code", "")
+            )
+            new_pass = _doprax_mod.get_password(config.doprax_api_key, vm_code)
+            if not new_pass:
+                logging.error(f"Could not get password for VM {service_id}. Cleaning up and retrying...")
+                _cleanup_failed_vm(config, service_id, state, dc)
+                continue
+            logging.info(f"VM ready: {new_user}@{new_ip}")
+
+            # Ping check from Iran
+            logging.info(f"Pinging new VM {new_ip} from Iran...")
+            rate, avg_ms = ping_host(new_ip, timeout=config.ping_poll_timeout)
+            logging.info(
+                f"New VM ping results: rate={rate:.1f}%, avg={avg_ms:.1f}ms"
+                if avg_ms else f"rate={rate:.1f}%, avg=N/A"
+            )
+
+            if rate < config.minimum_rating or (avg_ms is not None and avg_ms > config.minimum_ping):
+                logging.warning(
+                    f"New VM {new_ip} fails checks (rate={rate:.1f}%<{config.minimum_rating}%, "
+                    f"ping={avg_ms}>{config.minimum_ping}ms). Deleting VM and marking DC as bad."
+                )
+                _cleanup_failed_vm(config, service_id, state, dc)
+                continue
+
+            return {
+                "plan": plan,
+                "detail": detail,
+                "service_id": service_id,
+                "new_ip": new_ip,
+                "new_user": new_user,
+                "new_pass": new_pass,
+                "new_node_name": new_node_name,
+            }
+        except Exception as e:
+            logging.error(f"VM creation/validation failed (attempt {attempt}): {e}")
+            if service_id:
+                _cleanup_failed_vm(config, service_id, state, dc)
+            continue
+
+    logging.error(f"All {config.max_create_retries} VM create attempts failed. Giving up.")
+    return None
+
+
 async def _provision_new_node(
     config: AutoscalerConfig,
     state: Dict[str, Any],
@@ -690,90 +814,24 @@ async def _provision_new_node(
     """
     logging.info("=== Provisioning new node (scale-up) ===")
 
-    exclude_dcs = list(state.get("failed_datacenters", {}).keys())
-    plan = doprax_find_plan(config.doprax_api_key, config, exclude_datacenters=exclude_dcs)
-    if not plan:
-        logging.warning("No matching Doprax plan found for scale-up. Will retry next cycle.")
-        return False
-
-    dc = _doprax_mod.get_plan_datacenter(plan)
-    traffic = _doprax_get_plan_traffic(plan)
-    monthly_cents = _doprax_mod.extract_monthly_price_cents(plan)
-    new_node_name = build_node_name(dc, plan)
-    traffic_bytes = _doprax_get_plan_traffic_bytes(plan)
-
-    logging.info(
-        f"Selected plan: dc={dc}, ${monthly_cents/100:.2f}/mo, traffic={traffic}, name='{new_node_name}'"
-    )
-
     if config.dry_run:
         logging.info("[DRY-RUN] Would create Doprax VM and provision new node.")
         return True
 
-    # Create VM
-    service_id, create_resp = doprax_create_vm(
-        config.doprax_api_key, plan, config.doprax_image, new_node_name
-    )
-    if not service_id:
-        logging.error("Failed to create Doprax VM for scale-up.")
+    vm_info = _create_validated_vm(config, state)
+    if not vm_info:
         return False
 
-    logging.info(f"Doprax VM created: service_id={service_id}")
-    create_data = (create_resp or {}).get("data") or {}
-    op_id = create_data.get("operation_id")
-    if op_id:
-        _doprax_mod._poll_operation(config.doprax_api_key, op_id, max_wait=config.vm_ready_timeout)
-
-    # Wait for VM ready
-    detail = doprax_wait_vm_ready(
-        config.doprax_api_key, service_id,
-        timeout=config.vm_ready_timeout,
-        interval=config.vm_ready_poll_interval,
-    )
-    if not detail:
-        logging.error(f"VM {service_id} did not become active. Cleaning up...")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
-    # Get access
-    access = doprax_extract_access(detail)
-    if not access or not access["ip"]:
-        logging.error(f"Could not extract access info for VM {service_id}")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
-    new_ip = access["ip"]
-    new_user = access["username"]
-    vm_code = detail.get("vm", {}).get("vm_code", "")
-    new_pass = _doprax_mod.get_password(config.doprax_api_key, vm_code)
-    if not new_pass:
-        logging.error(f"Could not get password for VM {service_id}")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-    logging.info(f"VM ready: {new_user}@{new_ip}")
-
-    # Ping check
-    logging.info(f"Pinging new VM {new_ip} from Iran...")
-    rate, avg_ms = ping_host(new_ip, timeout=config.ping_poll_timeout)
-    logging.info(f"New VM ping results: rate={rate:.1f}%, avg={avg_ms:.1f}ms" if avg_ms else f"rate={rate:.1f}%, avg=N/A")
-
-    if rate < config.minimum_rating or (avg_ms is not None and avg_ms > config.minimum_ping):
-        logging.warning(
-            f"New VM {new_ip} fails checks (rate={rate:.1f}%<{config.minimum_rating}%, "
-            f"ping={avg_ms}>{config.minimum_ping}ms). Deleting VM and marking DC as bad."
-        )
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        state.setdefault("failed_datacenters", {})[dc] = datetime.now(timezone.utc).isoformat()
-        _save_state(config.state_file, state)
-        return False
+    plan = vm_info["plan"]
+    service_id = vm_info["service_id"]
+    new_ip = vm_info["new_ip"]
+    new_user = vm_info["new_user"]
+    new_pass = vm_info["new_pass"]
+    new_node_name = vm_info["new_node_name"]
+    traffic_bytes = _doprax_get_plan_traffic_bytes(plan)
 
     # Install PasarGuard
     logging.info(f"Installing PasarGuard node on {new_user}@{new_ip}...")
-    if not new_pass:
-        logging.error("No password available for SSH. Cannot install node.")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
     creds = SSHCredentials(host=new_ip, username=new_user, password=new_pass)
     try:
         install_result: NodeInstallResult = _install_pg_node(creds)
@@ -798,14 +856,6 @@ async def _provision_new_node(
         certificate=install_result.certificate,
         data_limit=traffic_bytes,
     )
-    if not new_pg_node_id:
-        logging.error("Failed to add new node to PasarGuard panel. Aborting.")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
-
-
-
     if not new_pg_node_id:
         logging.error("Failed to add new node to PasarGuard panel. Aborting.")
         doprax_delete_vm(config.doprax_api_key, service_id)
@@ -851,98 +901,25 @@ async def _replace_failing_node(
 
     logging.info(f"=== Replacing node '{node_name}' (id={node_id}, addr={node_addr}) ===")
 
-    # ── 1. Find a Doprax plan ──
-    exclude_dcs = list(state.get("failed_datacenters", {}).keys())
-    plan = doprax_find_plan(config.doprax_api_key, config, exclude_datacenters=exclude_dcs)
-    if not plan:
-        logging.warning("No matching Doprax plan found. Will retry next cycle.")
-        return False
-
-    dc = _doprax_mod.get_plan_datacenter(plan)
-    traffic = _doprax_get_plan_traffic(plan)
-    monthly_cents = _doprax_mod.extract_monthly_price_cents(plan)
-    new_node_name = build_node_name(dc, plan)
-    traffic_bytes = _doprax_get_plan_traffic_bytes(plan)
-
-    logging.info(
-        f"Selected plan: dc={dc}, ${monthly_cents/100:.2f}/mo, traffic={traffic}, name='{new_node_name}'"
-        + (f", data_limit={traffic_bytes} bytes" if traffic_bytes else "")
-    )
-
     if config.dry_run:
         logging.info("[DRY-RUN] Would create Doprax VM and proceed with replacement.")
         return True
 
-    # ── 2. Create Doprax VM ──
-    service_id, create_resp = doprax_create_vm(
-        config.doprax_api_key, plan, config.doprax_image, new_node_name
-    )
-    if not service_id:
-        logging.error("Failed to create Doprax VM.")
+    # ── Create + validate a new Doprax VM (with retries) ──
+    vm_info = _create_validated_vm(config, state)
+    if not vm_info:
         return False
 
-    logging.info(f"Doprax VM created: service_id={service_id}")
+    plan = vm_info["plan"]
+    service_id = vm_info["service_id"]
+    new_ip = vm_info["new_ip"]
+    new_user = vm_info["new_user"]
+    new_pass = vm_info["new_pass"]
+    new_node_name = vm_info["new_node_name"]
+    traffic_bytes = _doprax_get_plan_traffic_bytes(plan)
 
-    # Poll operation if present
-    create_data = (create_resp or {}).get("data") or {}
-    op_id = create_data.get("operation_id")
-    if op_id:
-        _doprax_mod._poll_operation(config.doprax_api_key, op_id, max_wait=config.vm_ready_timeout)
-
-    # ── 3. Wait for VM to be ready ──
-    logging.info(f"Waiting for VM {service_id} to become active...")
-    detail = doprax_wait_vm_ready(
-        config.doprax_api_key, service_id,
-        timeout=config.vm_ready_timeout,
-        interval=config.vm_ready_poll_interval,
-    )
-    if not detail:
-        logging.error(f"VM {service_id} did not become active. Cleaning up...")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
-    # ── 4. Get VM access (IP, username, password) ──
-    access = doprax_extract_access(detail)
-    if not access or not access["ip"]:
-        logging.error(f"Could not extract access info for VM {service_id}")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
-    new_ip = access["ip"]
-    new_user = access["username"]
-    vm_code = detail.get('links', {}).get("vm_code", "")
-    new_pass = _doprax_mod.get_password(config.doprax_api_key, vm_code)
-    if not new_pass:
-        logging.error(f"Could not get password for VM {service_id}")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
-    # new_pass = access["password"]
-    logging.info(f"VM ready: {new_user}@{new_ip}")
-
-    # ── 5. Ping the new VM from Iran ──
-    logging.info(f"Pinging new VM {new_ip} from Iran...")
-    rate, avg_ms = ping_host(new_ip, timeout=config.ping_poll_timeout)
-    logging.info(f"New VM ping results: rate={rate:.1f}%, avg={avg_ms:.1f}ms" if avg_ms else f"rate={rate:.1f}%, avg=N/A")
-
-    if rate < config.minimum_rating or (avg_ms is not None and avg_ms > config.minimum_ping):
-        logging.warning(
-            f"New VM {new_ip} also fails checks (rate={rate:.1f}%<{config.minimum_rating}%, "
-            f"ping={avg_ms}>{config.minimum_ping}ms). Deleting VM and marking DC as bad."
-        )
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        # Mark this datacenter as bad so we try a different one next time
-        state.setdefault("failed_datacenters", {})[dc] = datetime.now(timezone.utc).isoformat()
-        _save_state(config.state_file, state)
-        return False
-
-    # ── 6. Install PasarGuard node on the new VM ──
+    # ── Install PasarGuard node on the new VM ──
     logging.info(f"Installing PasarGuard node on {new_user}@{new_ip}...")
-    if not new_pass:
-        logging.error("No password available for SSH. Cannot install node.")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
     creds = SSHCredentials(host=new_ip, username=new_user, password=new_pass)
     try:
         install_result: NodeInstallResult = _install_pg_node(creds)
@@ -956,7 +933,7 @@ async def _replace_failing_node(
         f"cert={'yes' if install_result.certificate else 'no'}"
     )
 
-    # ── 7. Add new node to PasarGuard panel (with data_limit from plan if capped) ──
+    # ── Add new node to PasarGuard panel (with data_limit from plan if capped) ──
     pg_api, pg_token = await pg_login(config)
     new_pg_node_id = await pg_add_node(
         pg_api, pg_token, config,
@@ -972,12 +949,6 @@ async def _replace_failing_node(
         doprax_delete_vm(config.doprax_api_key, service_id)
         return False
 
-
-    if not new_pg_node_id:
-        logging.error("Failed to add new node to PasarGuard panel. Aborting.")
-        doprax_delete_vm(config.doprax_api_key, service_id)
-        return False
-
     # Add host to panel with country as name
     country = _doprax_mod.get_plan_country(plan)
     if country and config.host_inbound_tag:
@@ -987,7 +958,7 @@ async def _replace_failing_node(
     elif not config.host_inbound_tag:
         logging.debug("No PASARGUARD_HOST_INBOUND_TAG set, skipping host creation.")
 
-    # ── 8. Disable old failing node ──
+    # ── Disable old failing node ──
     logging.info(f"Disabling old node {node_id} ('{node_name}')...")
     disabled = await pg_disable_node(pg_api, pg_token, node_id)
     if not disabled:
@@ -996,7 +967,7 @@ async def _replace_failing_node(
             f"Please disable it manually from the PasarGuard panel."
         )
 
-    # ── 9. Update state ──
+    # ── Update state ──
     state.setdefault("replaced_nodes", {})[str(node_id)] = {
         "old_name": node_name,
         "old_address": node_addr,
