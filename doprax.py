@@ -213,6 +213,7 @@ def get_option_id(opt: dict) -> str | None:
 
 def get_plan_country(plan: dict) -> str:
     """Get the 2-letter country code from a plan's location options."""
+    return "VIP"
     for _, opt in _extract_all_options(plan):
         meta = opt.get("metadata") or {}
         # Direct country_code in metadata

@@ -93,7 +93,7 @@ class NodeInstallError(RuntimeError):
 
 def _connect(
     creds: SSHCredentials,
-    ready_timeout: int = 180,
+    ready_timeout: int = 300,
     retry_interval: float = 5.0,
 ) -> paramiko.SSHClient:
     """
@@ -127,15 +127,17 @@ def _connect(
                 look_for_keys=False,
                 allow_agent=False,
             )
-            return client
         except paramiko.ssh_exception.BadAuthenticationType as e:
             # Password auth not enabled yet (cloud-init still running) -> retry.
             last_err = e
+            client.close()
             logging.warning(
                 f"[attempt {attempt}] {creds.host}: password auth not accepted yet "
                 f"(server currently allows {getattr(e, 'allowed_types', '?')}). "
                 f"Retrying in {retry_interval:.0f}s..."
             )
+            time.sleep(retry_interval)
+            continue
         except (
             paramiko.ssh_exception.NoValidConnectionsError,
             ConnectionRefusedError,
@@ -145,21 +147,22 @@ def _connect(
         ) as e:
             # sshd not up yet / network not ready -> retry.
             last_err = e
+            client.close()
             logging.warning(
                 f"[attempt {attempt}] {creds.host}: SSH not reachable yet ({e}). "
                 f"Retrying in {retry_interval:.0f}s..."
             )
+            time.sleep(retry_interval)
+            continue
         except paramiko.ssh_exception.AuthenticationException as e:
             # Genuinely wrong credentials -> don't waste the whole timeout retrying.
+            client.close()
             raise NodeInstallError(
                 f"SSH authentication failed for {creds.username}@{creds.host}: {e}"
             ) from e
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
-        time.sleep(retry_interval)
+        else:
+            # Connected successfully - return the live client as-is.
+            return client
 
     raise NodeInstallError(
         f"Could not establish SSH connection to {creds.host} within {ready_timeout}s "

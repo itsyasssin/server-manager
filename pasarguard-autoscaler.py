@@ -1045,8 +1045,8 @@ async def run_one_cycle(config: AutoscalerConfig, state: Dict[str, Any]) -> None
             logging.warning(f"Node {nname} (id={nid}) has no address, skipping.")
             continue
 
-        if nstatus == "limited":
-            logging.warning(f"Node {nname} has hit the data limit.")
+        if nstatus == "limited" or nstatus == "disabled":
+            logging.warning(f"Node {nname} has hit the data limit or disabled.")
             failing_nodes.append(node)
             continue
 
