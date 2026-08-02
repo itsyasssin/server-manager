@@ -159,6 +159,84 @@ async def hosts_remove(api, token: str, args) -> None:
         logging.info(f"Removed {result.count} hosts: {result.hosts}")
 
 
+def _coerce_addresses(value: Any) -> list[str]:
+    """Best-effort: normalize a host.address field into a list[str]."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        out: list[str] = []
+        for x in value:
+            if x is None:
+                continue
+            out.append(str(x))
+        return out
+    return [str(value)]
+
+
+async def purge_by_ip(api, token: str, ip: str) -> dict:
+    """Delete every host and node in panel matching the given IP.
+
+    Matching rules:
+      - Nodes: node.address == ip
+      - Hosts: ip is present in host.address list
+
+    Returns a summary dict.
+    """
+    # Nodes
+    resp = await api.get_nodes(token=token, offset=0, limit=100)
+    nodes = [
+        _model_dump(n)
+        for n in getattr(resp, "nodes", [])
+        if (_model_dump(n).get("address") == ip)
+    ]
+    node_ids = [int(n["id"]) for n in nodes if n.get("id") is not None]
+
+    # Hosts
+    hosts_raw = await api.get_hosts(token=token, offset=0, limit=100)
+    hosts = [_model_dump(h) for h in (hosts_raw or [])]
+    host_ids: list[int] = []
+    for h in hosts:
+        addresses = _coerce_addresses(h.get("address"))
+        if ip in addresses and h.get("id") is not None:
+            host_ids.append(int(h["id"]))
+
+    summary = {
+        "ip": ip,
+        "matched": {"nodes": node_ids, "hosts": host_ids},
+        "deleted": {"nodes": [], "hosts": []},
+        "errors": [],
+    }
+
+    # Delete hosts first (they may point at node IPs; safer order)
+    for hid in host_ids:
+        try:
+            await api.remove_host(host_id=hid, token=token)
+            summary["deleted"]["hosts"].append(hid)
+            logging.info(f"Host {hid} removed (matched ip={ip}).")
+        except Exception as e:
+            summary["errors"].append({"type": "host", "id": hid, "error": str(e)})
+            logging.error(f"Failed removing host {hid}: {e}")
+
+    for nid in node_ids:
+        try:
+            await api.remove_node(node_id=nid, token=token)
+            summary["deleted"]["nodes"].append(nid)
+            logging.info(f"Node {nid} deleted (matched ip={ip}).")
+        except Exception as e:
+            summary["errors"].append({"type": "node", "id": nid, "error": str(e)})
+            logging.error(f"Failed deleting node {nid}: {e}")
+
+    return summary
+
+
+async def purge_cmd(api, token: str, args) -> None:
+    """CLI handler: purge by IP."""
+    result = await purge_by_ip(api, token, args.ip)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 # ── CLI setup ───────────────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -238,6 +316,10 @@ def build_parser() -> argparse.ArgumentParser:
     h_rm = hosts_sub.add_parser("remove", help="Remove host(s)")
     h_rm.add_argument("--id", required=True, help="Host ID(s), comma-separated (e.g. 3 or 3,4,5)")
 
+    # purge
+    purge_p = sub.add_parser("purge", help="Delete all nodes + hosts that match an IP")
+    purge_p.add_argument("--ip", required=True, help="IP address to purge")
+
     return parser
 
 
@@ -250,6 +332,7 @@ ACTION_MAP = {
     ("hosts", "list"):   hosts_list,
     ("hosts", "add"):    hosts_add,
     ("hosts", "remove"): hosts_remove,
+    ("purge", None):      purge_cmd,
 }
 
 

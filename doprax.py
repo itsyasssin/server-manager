@@ -41,6 +41,9 @@ Usage:
     # Delete a VM
     python3 doprax-vps-manager.py delete --service-id UUID
 
+    # Delete VM(s) by IP
+    python3 doprax-vps-manager.py delete-by-ip --ip 1.2.3.4
+
 OpenAPI Spec: https://www.doprax.com/reference/api/
 """
 
@@ -481,6 +484,107 @@ def cmd_add(api_key: str, args) -> None:
         _poll_operation(api_key, op_id)
 
 
+def delete_vm(api_key: str, service_id: str) -> dict:
+    """Delete a VM by issuing the 'delete' lifecycle action.
+
+    POST /api/v2/services/instances/{service_id}/operations/
+    Returns the raw API response.
+    """
+    body = {
+        "action": "delete",
+        "idempotency_key": str(_uuid.uuid4()),
+    }
+    return api_request(
+        "POST",
+        f"/api/v2/services/instances/{service_id}/operations/",
+        api_key,
+        body=body,
+    )
+
+
+def _extract_ip_from_vm_summary(vm: dict, api_key: str) -> str:
+    """Best-effort: extract an IPv4 string from a Doprax VM summary dict."""
+    # Observed/possible shapes across endpoints
+    resp = api_request("GET", f"/api/v2/services/instances/{vm}/detail/", api_key)
+
+    for key in ("public_ipv4", "ipv4", "ip", "address"):
+        val = vm.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    access = vm.get("access") or {}
+    if isinstance(access, dict):
+        val = access.get("public_ipv4")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    # Some responses include nested vm object
+    inner = vm.get("vm") or {}
+    if isinstance(inner, dict):
+        val = inner.get("ipv4") or inner.get("public_ipv4")
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    return ""
+
+
+def delete_vm_by_ip(api_key: str, ip: str, *, require_unique: bool = True) -> dict:
+    """Find Doprax VM(s) by IP and delete them.
+
+    - Scans all instances via /services/instances/list/ (all pages)
+    - Matches if extracted ipv4 == ip
+    - If require_unique=True and multiple match, returns an error summary (no deletions).
+
+    Returns a summary dict.
+    """
+    vms, _meta = _all_pages(api_key, "/api/v2/services/instances/list/")
+
+    matches: list[dict] = []
+    for vm in vms:
+        vm_ip = _extract_ip_from_vm_summary(vm, api_key)
+        if vm_ip == ip:
+            matches.append(vm)
+
+    service_ids: list[str] = []
+    for m in matches:
+        sid = m.get("service_id") or m.get("id")
+        if sid:
+            service_ids.append(str(sid))
+
+    summary: dict = {
+        "ip": ip,
+        "matched_service_ids": service_ids,
+        "deleted_service_ids": [],
+        "errors": [],
+    }
+
+    if require_unique and len(service_ids) > 1:
+        summary["errors"].append(
+            {
+                "type": "ambiguous",
+                "error": f"Multiple VMs match ip={ip}. Refusing to delete.",
+            }
+        )
+        return summary
+
+    for sid in service_ids:
+        try:
+            resp = delete_vm(api_key, sid)
+            summary["deleted_service_ids"].append(sid)
+            # If operation_id exists, include it for the caller
+            data = (resp or {}).get("data") or {}
+            op_id = data.get("operation_id")
+            if op_id:
+                summary.setdefault("operation_ids", []).append(op_id)
+        except Exception as e:
+            summary["errors"].append({"type": "delete", "service_id": sid, "error": str(e)})
+
+    return summary
+
+
+def cmd_delete_by_ip(api_key: str, args) -> None:
+    """Delete a VM by IP address."""
+    result = delete_vm_by_ip(api_key, args.ip, require_unique=not args.allow_multiple)
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
 def cmd_delete(api_key: str, args) -> None:
     """Delete a VM by issuing the 'delete' lifecycle action.
 
@@ -491,18 +595,8 @@ def cmd_delete(api_key: str, args) -> None:
     """
     service_id = args.service_id
 
-    body = {
-        "action": "delete",
-        "idempotency_key": str(_uuid.uuid4()),
-    }
-
     print(f"[*] Deleting VM {service_id} ...")
-    resp = api_request(
-        "POST",
-        f"/api/v2/services/instances/{service_id}/operations/",
-        api_key,
-        body=body,
-    )
+    resp = delete_vm(api_key, service_id)
     print(json.dumps(resp, indent=2, ensure_ascii=False))
 
     data = resp.get("data")
@@ -599,6 +693,15 @@ def build_parser() -> argparse.ArgumentParser:
     rm.add_argument("--service-id", required=True, dest="service_id",
                     help="Service UUID to delete")
 
+    # ── delete-by-ip ──
+    rm_ip = sub.add_parser("delete-by-ip", help="Delete VM(s) by IPv4")
+    rm_ip.add_argument("--ip", required=True, help="IPv4 address to match")
+    rm_ip.add_argument(
+        "--allow-multiple",
+        action="store_true",
+        help="If multiple VMs match this IP, delete all of them (dangerous).",
+    )
+
     return p
 
 
@@ -610,6 +713,7 @@ COMMAND_MAP = {
     "catalogue": cmd_catalogue,
     "add": cmd_add,
     "delete": cmd_delete,
+    "delete-by-ip": cmd_delete_by_ip,
 }
 
 

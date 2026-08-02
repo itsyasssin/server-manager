@@ -62,7 +62,6 @@ from ping import (
 
 # doprax.py
 import doprax as _doprax_mod
-
 # install_pasarguard_node.py
 from install_pasarguard_node import (
     install_node as _install_pg_node,
@@ -75,6 +74,7 @@ from pasarguard_manager import (
     _import_sdk,
     _model_dump,
     get_token,
+    purge_by_ip,
 )
 
 _pg_import_sdk = _import_sdk
@@ -547,7 +547,7 @@ async def pg_login(config: AutoscalerConfig):
 
 async def pg_list_nodes(api, token: str) -> List[Dict[str, Any]]:
     """Fetch all enabled nodes as plain dicts."""
-    resp = await api.get_nodes(token=token, offset=0, limit=100, enabled=True)
+    resp = await api.get_nodes(token=token, offset=0, limit=100)
     nodes = []
     for node in resp.nodes:
         nodes.append(_pg_model_dump(node))
@@ -671,7 +671,9 @@ def build_node_name(datacenter: str, plan: Dict) -> str:
         traffic_clean = "NA"
 
     dc = datacenter.replace("_", "-").lower()
-    return f"{dc}-{price_usd:g}usd-{traffic_clean}"
+    # echoch time
+    epoch_time = datetime.now().strftime("%Y%m%d%H%M%S")
+    return f"automatic - {dc}-${price_usd:g}-{traffic_clean}-{epoch_time}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -908,7 +910,7 @@ async def _replace_failing_node(
 
     new_ip = access["ip"]
     new_user = access["username"]
-    vm_code = detail.get("vm_code", "")
+    vm_code = detail.get('links', {}).get("vm_code", "")
     new_pass = _doprax_mod.get_password(config.doprax_api_key, vm_code)
     if not new_pass:
         logging.error(f"Could not get password for VM {service_id}")
@@ -1066,8 +1068,15 @@ async def run_one_cycle(config: AutoscalerConfig, state: Dict[str, Any]) -> None
         addr = node.get("address", "")
         nid = node.get("id")
         nname = node.get("name", "?")
+        nstatus = node.get("status", "?")
+
         if not addr:
             logging.warning(f"Node {nname} (id={nid}) has no address, skipping.")
+            continue
+
+        if nstatus == "limited":
+            logging.warning(f"Node {nname} has hit the data limit.")
+            failing_nodes.append(node)
             continue
 
         logging.info(f"Pinging node '{nname}' ({addr})...")
@@ -1099,6 +1108,10 @@ async def run_one_cycle(config: AutoscalerConfig, state: Dict[str, Any]) -> None
     replaced_ids = set(state.get("replaced_nodes", {}).keys())
     for node in failing_nodes:
         nid_str = str(node.get("id", ""))
+        addr = str(node.get("address", ""))
+        logging.info(f"Replacing node {node.get('name')} (id={nid_str}) at {addr}...")
+        await purge_by_ip(pg_api, pg_token, addr)
+        _doprax_mod.delete_vm_by_ip(config.doprax_api_key, addr)
         if nid_str in replaced_ids:
             logging.info(f"Node {node.get('name')} (id={nid_str}) already replaced in a previous cycle. Skipping.")
             continue
