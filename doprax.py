@@ -90,7 +90,7 @@ def api_request(method: str, path: str, api_key: str,
         method=method,
         headers=headers
     )
-    proxy = "socks5://me.computer:10809"
+    # proxy = "socks5://me.computer:10809"
 
     if proxy:
         opener = urllib.request.build_opener(
@@ -99,11 +99,22 @@ def api_request(method: str, path: str, api_key: str,
                 "https": proxy,
             })
         )
-        with opener.open(req, timeout=30) as resp:
-            return json.loads(resp.read().decode())
+        with opener.open(req, timeout=60) as resp:
+            content = resp.read().decode()
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                print(f"Failed to decode JSON: {content}")
+                return {}
 
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return json.loads(resp.read().decode())
+    with urllib.request.urlopen(req, timeout=50) as resp:
+        content = resp.read().decode()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            print(f"Failed to decode JSON: {content}")
+            return {}
+
 
 def _all_pages(api_key: str, path: str,
                query: dict | None = None) -> tuple[list[dict], dict]:
