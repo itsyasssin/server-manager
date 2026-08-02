@@ -836,7 +836,7 @@ async def _provision_new_node(
     try:
         install_result: NodeInstallResult = _install_pg_node(creds)
     except Exception as e:
-        logging.error(f"PasarGuard node install failed: {e}")
+        logging.exception(f"PasarGuard node install failed: {e}")
         doprax_delete_vm(config.doprax_api_key, service_id)
         return False
 
@@ -924,7 +924,7 @@ async def _replace_failing_node(
     try:
         install_result: NodeInstallResult = _install_pg_node(creds)
     except Exception as e:
-        logging.error(f"PasarGuard node install failed: {e}")
+        logging.exception(f"PasarGuard node install failed: {e}")
         doprax_delete_vm(config.doprax_api_key, service_id)
         return False
 

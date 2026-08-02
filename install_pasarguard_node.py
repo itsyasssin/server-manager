@@ -41,7 +41,9 @@ from __future__ import annotations
 import argparse
 import getpass
 import re
+import socket
 import sys
+import time
 from dataclasses import dataclass
 from typing import Optional
 import logging
@@ -89,19 +91,80 @@ class NodeInstallError(RuntimeError):
     pass
 
 
-def _connect(creds: SSHCredentials) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(
-        hostname=creds.host,
-        port=creds.port,
-        username=creds.username,
-        password=creds.password,
-        # key_filename=creds.key_filename,
-        # passphrase=creds.key_passphrase,
-        timeout=30,
+def _connect(
+    creds: SSHCredentials,
+    ready_timeout: int = 180,
+    retry_interval: float = 5.0,
+) -> paramiko.SSHClient:
+    """
+    Connect over SSH, retrying for a while if the server isn't fully ready yet.
+
+    Freshly-booted cloud VMs commonly bring up sshd before cloud-init has
+    finished setting the root password / enabling password auth. During that
+    window the server correctly reports "Bad authentication type; allowed
+    types: ['publickey']" even though the password is valid and will work a
+    few seconds later. We treat that (plus connection-refused/timeout, which
+    happen while sshd itself is still starting) as transient and retry until
+    ready_timeout elapses, instead of failing on the first attempt.
+    """
+    deadline = time.monotonic() + ready_timeout
+    attempt = 0
+    last_err: Optional[Exception] = None
+
+    while time.monotonic() < deadline:
+        attempt += 1
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            client.connect(
+                hostname=creds.host,
+                port=creds.port,
+                username=creds.username,
+                password=creds.password,
+                key_filename=creds.key_filename,
+                passphrase=creds.key_passphrase,
+                timeout=30,
+                look_for_keys=False,
+                allow_agent=False,
+            )
+            return client
+        except paramiko.ssh_exception.BadAuthenticationType as e:
+            # Password auth not enabled yet (cloud-init still running) -> retry.
+            last_err = e
+            logging.warning(
+                f"[attempt {attempt}] {creds.host}: password auth not accepted yet "
+                f"(server currently allows {getattr(e, 'allowed_types', '?')}). "
+                f"Retrying in {retry_interval:.0f}s..."
+            )
+        except (
+            paramiko.ssh_exception.NoValidConnectionsError,
+            ConnectionRefusedError,
+            socket.timeout,
+            TimeoutError,
+            OSError,
+        ) as e:
+            # sshd not up yet / network not ready -> retry.
+            last_err = e
+            logging.warning(
+                f"[attempt {attempt}] {creds.host}: SSH not reachable yet ({e}). "
+                f"Retrying in {retry_interval:.0f}s..."
+            )
+        except paramiko.ssh_exception.AuthenticationException as e:
+            # Genuinely wrong credentials -> don't waste the whole timeout retrying.
+            raise NodeInstallError(
+                f"SSH authentication failed for {creds.username}@{creds.host}: {e}"
+            ) from e
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+        time.sleep(retry_interval)
+
+    raise NodeInstallError(
+        f"Could not establish SSH connection to {creds.host} within {ready_timeout}s "
+        f"(likely still finishing boot / cloud-init). Last error: {last_err}"
     )
-    return client
 
 
 def _run(client: paramiko.SSHClient, command: str, input_text: str = "", timeout: int = 900):
@@ -120,10 +183,15 @@ def install_node(
     creds: SSHCredentials,
     node_name: Optional[str] = None,
     extra_install_args: Optional[list[str]] = None,
+    ssh_ready_timeout: int = 300,
 ) -> NodeInstallResult:
     """
     SSH into the target host, install PasarGuard Node non-interactively,
     then read back API_KEY, SERVICE_PORT, and the SSL certificate.
+
+    ssh_ready_timeout: how long (seconds) to keep retrying the initial SSH
+    connection while the VM finishes booting / cloud-init runs. Bump this up
+    if your provider's VMs are slow to enable password auth after "active".
     """
     name_arg = f" --name {node_name}" if node_name else ""
     extra_args = ""
@@ -131,8 +199,7 @@ def install_node(
         extra_args = " " + " ".join(extra_install_args)
 
     install_cmd = INSTALL_CMD_TEMPLATE.format(name_arg=name_arg, extra_args=extra_args)
-
-    client = _connect(creds)
+    client = _connect(creds, ready_timeout=ssh_ready_timeout)
     try:
         # Pipe "yes" as a safety net in case the script hits any interactive
         # prompt (package manager confirmations, overwrite prompts, etc).
