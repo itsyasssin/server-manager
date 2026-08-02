@@ -92,23 +92,25 @@ def api_request(
             "https": proxy,
         }
 
-    resp = requests.request(
-        method=method,
-        url=url,
-        params=query,
-        json=body,
-        headers=headers,
-        proxies=proxies,
-        timeout=60,
-    )
-
-    resp.raise_for_status()
-
     try:
-        return resp.json()
-    except requests.JSONDecodeError:
-        print(resp.text)
-        return {}
+        resp = requests.request(
+            method=method,
+            url=url,
+            params=query,
+            json=body,
+            headers=headers,
+            proxies=proxies,
+            timeout=60,
+        )
+
+        resp.raise_for_status()
+
+        try:
+            return resp.json()
+        except requests.JSONDecodeError:
+            print(resp.text)
+            return {}
+
     except:
         logging.exception("Unexpected error")
         return {}
