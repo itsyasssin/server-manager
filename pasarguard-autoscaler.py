@@ -1081,15 +1081,18 @@ async def run_one_cycle(config: AutoscalerConfig, state: Dict[str, Any]) -> None
         nid_str = str(node.get("id", ""))
         addr = str(node.get("address", ""))
         logging.info(f"Replacing node {node.get('name')} (id={nid_str}) at {addr}...")
-        await purge_by_ip(pg_api, pg_token, addr)
-        _doprax_mod.delete_vm_by_ip(config.doprax_api_key, addr)
         if nid_str in replaced_ids:
             logging.info(f"Node {node.get('name')} (id={nid_str}) already replaced in a previous cycle. Skipping.")
             continue
 
         success = await _replace_failing_node(node, config, state)
-        if not success:
+
+        if success:
+            await purge_by_ip(pg_api, pg_token, addr)
+            _doprax_mod.delete_vm_by_ip(config.doprax_api_key, addr)
+        else:
             state["stats"]["failures"] = state["stats"].get("failures", 0) + 1
+
         _save_state(config.state_file, state)
         break  # Only one replacement per cycle
     else:
