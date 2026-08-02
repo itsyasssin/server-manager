@@ -502,26 +502,28 @@ def delete_vm(api_key: str, service_id: str) -> dict:
     )
 
 
-def _extract_ip_from_vm_summary(vm: dict, api_key: str) -> str:
-    """Best-effort: extract an IPv4 string from a Doprax VM summary dict."""
-    # Observed/possible shapes across endpoints
-    resp = api_request("GET", f"/api/v2/services/instances/{vm}/detail/", api_key)
+def _get_vm_ip(api_key: str, service_id: str) -> str:
+    """Fetch VM detail and extract its IPv4 address.
 
-    for key in ("public_ipv4", "ipv4", "ip", "address"):
-        val = vm.get(key)
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    access = vm.get("access") or {}
-    if isinstance(access, dict):
-        val = access.get("public_ipv4")
-        if isinstance(val, str) and val.strip():
-            return val.strip()
-    # Some responses include nested vm object
-    inner = vm.get("vm") or {}
-    if isinstance(inner, dict):
-        val = inner.get("ipv4") or inner.get("public_ipv4")
-        if isinstance(val, str) and val.strip():
-            return val.strip()
+    The list endpoint only returns a summary (no IP), so each VM must be
+    looked up individually via GET /services/instances/{service_id}/detail/.
+    Response: { success, data: ServiceDetailDataSchema }
+      data.vm     — VMDataSchema (id, ..., ipv4, ipv6, ...)
+      data.access — ServiceAccessSchema (username, public_ipv4, ...)
+    """
+    resp = api_request("GET", f"/api/v2/services/instances/{service_id}/detail/", api_key)
+    data = resp.get("data") or {}
+
+    vm = data.get("vm") or {}
+    access = data.get("access") or {}
+
+    for container in (vm, access, data):
+        if not isinstance(container, dict):
+            continue
+        for key in ("public_ipv4", "ipv4", "ip", "address"):
+            val = container.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
     return ""
 
 
@@ -538,7 +540,10 @@ def delete_vm_by_ip(api_key: str, ip: str, *, require_unique: bool = True) -> di
 
     matches: list[dict] = []
     for vm in vms:
-        vm_ip = _extract_ip_from_vm_summary(vm, api_key)
+        sid = vm.get("service_id") or vm.get("id")
+        if not sid:
+            continue
+        vm_ip = _get_vm_ip(api_key, str(sid))
         if vm_ip == ip:
             matches.append(vm)
 
