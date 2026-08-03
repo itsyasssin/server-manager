@@ -121,28 +121,46 @@ def api_request(
             "https": proxy,
         }
 
-    try:
-        resp = requests.request(
-            method=method,
-            url=url,
-            params=query,
-            json=body,
-            headers=headers,
-            proxies=proxies,
-            timeout=60,
-        )
-
-        resp.raise_for_status()
-
+    max_attempts = 5
+    for attempt in range(max_attempts):
         try:
-            return resp.json()
-        except requests.JSONDecodeError:
-            print(resp.text)
-            return {}
+            resp = requests.request(
+                method=method,
+                url=url,
+                params=query,
+                json=body,
+                headers=headers,
+                proxies=proxies,
+                timeout=60,
+            )
 
-    except:
-        logging.exception("Unexpected error")
-        return {}
+            resp.raise_for_status()
+
+            try:
+                return resp.json()
+            except requests.JSONDecodeError:
+                logging.warning(
+                    "JSON decode failed (%d/%d), retrying...",
+                    attempt + 1,
+                    max_attempts,
+                )
+                logging.debug(resp.text)
+
+                if attempt == max_attempts - 1:
+                    return {}
+
+                time.sleep(1)
+                continue
+
+        except requests.RequestException:
+            logging.exception("Request failed")
+
+            if attempt == max_attempts - 1:
+                return {}
+
+            time.sleep(1)
+
+    return {}
 
 def _all_pages(api_key: str, path: str,
                query: dict | None = None) -> tuple[list[dict], dict]:
