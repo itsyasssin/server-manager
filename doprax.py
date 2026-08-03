@@ -66,7 +66,36 @@ import uuid as _uuid
 
 BASE_URL = "https://www.doprax.com"
 
-
+FLAGS = {
+  "au": "🇦🇺",
+  "be": "🇧🇪",
+  "br": "🇧🇷",
+  "ca": "🇨🇦",
+  "ch": "🇨🇭",
+  "cl": "🇨🇱",
+  "de": "🇩🇪",
+  "es": "🇪🇸",
+  "fi": "🇫🇮",
+  "fr": "🇫🇷",
+  "gb": "🇬🇧",
+  "hk": "🇭🇰",
+  "id": "🇮🇩",
+  "il": "🇮🇱",
+  "in": "🇮🇳",
+  "it": "🇮🇹",
+  "jp": "🇯🇵",
+  "kr": "🇰🇷",
+  "mx": "🇲🇽",
+  "nl": "🇳🇱",
+  "pl": "🇵🇱",
+  "qa": "🇶🇦",
+  "sa": "🇸🇦",
+  "se": "🇸🇪",
+  "sg": "🇸🇬",
+  "tw": "🇹🇼",
+  "us": "🇺🇸",
+  "za": "🇿🇦"
+}
 # ── HTTP helper ──────────────────────────────────────────────────────────────
 
 def api_request(
@@ -219,18 +248,19 @@ def get_option_id(opt: dict) -> str | None:
 
 def get_plan_country(plan: dict) -> str:
     """Get the 2-letter country code from a plan's location options."""
-    return "VIP"
     for _, opt in _extract_all_options(plan):
         meta = opt.get("metadata") or {}
         # Direct country_code in metadata
         cc = meta.get("country_code")
         if cc:
-            return cc.lower()
+            _code = FLAGS.get(cc.lower(), "Vip")
+            return _code
         # Code might be like "ir-thr" — take first segment
         code = opt.get("code", "")
         if len(code) >= 2 and "-" in code:
-            return code.split("-")[0].lower()
-    return ""
+            _code = FLAGS.get(code.split("-")[0].lower(), "Vip")
+            return _code
+    return "vip"
 
 
 def get_plan_datacenter(plan: dict) -> str:
