@@ -137,6 +137,7 @@ def api_request(
             resp.raise_for_status()
 
             try:
+
                 return resp.json()
             except requests.JSONDecodeError:
                 logging.warning(
@@ -152,15 +153,21 @@ def api_request(
                 time.sleep(1)
                 continue
 
-        except requests.RequestException:
-            logging.exception("Request failed")
+        except:
+            logging.exception("trackback",
+            )
+            logging.warning(
+                "get response failed (%d/%d), retrying...",
+                attempt + 1,
+                max_attempts,
+            )
 
             if attempt == max_attempts - 1:
                 return {}
 
             time.sleep(1)
 
-    return {}
+    # return {}
 
 def _all_pages(api_key: str, path: str,
                query: dict | None = None) -> tuple[list[dict], dict]:
@@ -264,20 +271,24 @@ def get_option_id(opt: dict) -> str | None:
     return None
 
 
-def get_plan_country(plan: dict) -> str:
+def get_plan_country(plan: dict, flag=False) -> str:
     """Get the 2-letter country code from a plan's location options."""
     for _, opt in _extract_all_options(plan):
         meta = opt.get("metadata") or {}
         # Direct country_code in metadata
         cc = meta.get("country_code")
         if cc:
-            _code = FLAGS.get(cc.lower(), "Vip")
-            return _code
+            if flag:
+                _code = FLAGS.get(cc.lower(), "Vip")
+                return _code
+            return cc
         # Code might be like "ir-thr" — take first segment
         code = opt.get("code", "")
         if len(code) >= 2 and "-" in code:
-            _code = FLAGS.get(code.split("-")[0].lower(), "Vip")
-            return _code
+            if flag:
+                _code = FLAGS.get(code.split("-")[0].lower(), "Vip")
+                return _code
+            return code.split("-")[0]
     return "vip"
 
 

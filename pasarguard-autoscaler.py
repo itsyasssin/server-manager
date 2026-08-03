@@ -862,7 +862,7 @@ async def _provision_new_node(
         return False
 
     # Add host to panel with country as name
-    country = _doprax_mod.get_plan_country(plan)
+    country = _doprax_mod.get_plan_country(plan, flag=True)
     if country and config.host_inbound_tag:
         tags = config.host_inbound_tag.split(",")
         for t in tags:
@@ -953,7 +953,7 @@ async def _replace_failing_node(
         return False
 
     # Add host to panel with country as name
-    country = _doprax_mod.get_plan_country(plan)
+    country = _doprax_mod.get_plan_country(plan, flag=True)
     if country and config.host_inbound_tag:
         tags = config.host_inbound_tag.split(",")
         for t in tags:
