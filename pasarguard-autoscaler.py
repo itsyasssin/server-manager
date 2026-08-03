@@ -329,7 +329,7 @@ def doprax_find_plan(api_key: str, config: AutoscalerConfig,
 
 
 async def pg_add_host(api, token: str, config: AutoscalerConfig,
-                      country: str, address: str) -> Optional[int]:
+                      country: str, address: str, tag: str) -> Optional[int]:
     """Add a new host to the PasarGuard panel.
 
     Args:
@@ -343,7 +343,7 @@ async def pg_add_host(api, token: str, config: AutoscalerConfig,
         remark=country,
         address=[address],
         security="inbound_default",
-        inbound_tag=config.host_inbound_tag if config.host_inbound_tag else None,
+        inbound_tag=tag or  None,
         priority=1,
     )
     try:
@@ -864,9 +864,12 @@ async def _provision_new_node(
     # Add host to panel with country as name
     country = _doprax_mod.get_plan_country(plan)
     if country and config.host_inbound_tag:
-        host_id = await pg_add_host(pg_api, pg_token, config, country=country, address=new_ip)
-        if not host_id:
-            logging.warning(f"Failed to add host for country '{country}'. Node still added.")
+        tags = config.host_inbound_tag.split(",")
+        for t in tags:
+            host_id = await pg_add_host(pg_api, pg_token, config, country=country, address=new_ip, tag=t)
+            if not host_id:
+                logging.warning(f"Failed to add host for country '{country}'. Node still added.")
+
     elif not config.host_inbound_tag:
         logging.debug("No PASARGUARD_HOST_INBOUND_TAG set, skipping host creation.")
 
@@ -952,9 +955,12 @@ async def _replace_failing_node(
     # Add host to panel with country as name
     country = _doprax_mod.get_plan_country(plan)
     if country and config.host_inbound_tag:
-        host_id = await pg_add_host(pg_api, pg_token, config, country=country, address=new_ip)
-        if not host_id:
-            logging.warning(f"Failed to add host for country '{country}'. Node still added.")
+        tags = config.host_inbound_tag.split(",")
+        for t in tags:
+            host_id = await pg_add_host(pg_api, pg_token, config, country=country, address=new_ip, tag=t)
+            if not host_id:
+                logging.warning(f"Failed to add host for country '{country}'. Node still added.")
+
     elif not config.host_inbound_tag:
         logging.debug("No PASARGUARD_HOST_INBOUND_TAG set, skipping host creation.")
 
