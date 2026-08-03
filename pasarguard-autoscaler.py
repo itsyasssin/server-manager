@@ -1123,47 +1123,49 @@ def main() -> None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
-    # ── Load config ──
-    config = build_config(env_path=args.env)
-    config.dry_run = config.dry_run or args.dry_run
-    config.once = config.once or args.once
-
-    # Validate config
-    errors = []
-    if not config.doprax_api_key:
-        errors.append("DOPRAX_API_KEY is not set")
-    if not config.pasarguard_base_url:
-        errors.append("PASARGUARD_BASE_URL is not set")
-    if not config.pasarguard_username:
-        errors.append("PASARGUARD_ADMIN_USERNAME is not set")
-    if not config.host_inbound_tag:
-        errors.append("PASARGUARD_HOST_INBOUND_TAG is not set")
-
-    if not config.pasarguard_password:
-        errors.append("PASARGUARD_ADMIN_PASSWORD is not set")
-    if errors:
-        logging.error("Missing configuration:")
-        for e in errors:
-            logging.error(f"  - {e}")
-        sys.exit(1)
-
-    logging.info("PasarGuard Autoscaler starting...")
-    logging.info(f"  Host inbound tag: {config.host_inbound_tag or '(not set - hosts will not be created)'}")
-    logging.info(f"  Interval: {config.interval}s")
-    logging.info(f"  Min rating: {config.minimum_rating}%")
-    logging.info(f"  Max ping: {config.minimum_ping}ms")
-    logging.info(f"  Max budget: ${config.max_budget}/mo")
-    logging.info(f"  Min nodes: {config.min_nodes}")
-    logging.info(f"  Countries: {config.valid_countries}")
-    logging.info(f"  Datacenters: {config.valid_datacenters or '(any)'}")
-    logging.info(f"  Dry run: {config.dry_run}")
-
-    # ── Load state ──
-    state = _load_state(config.state_file)
-
     # ── Main loop ──
     try:
         while True:
+            # ── Load config ──
+            config = build_config(env_path=args.env)
+            config.dry_run = config.dry_run or args.dry_run
+            config.once = config.once or args.once
+
+            # Validate config
+            errors = []
+            if not config.doprax_api_key:
+                errors.append("DOPRAX_API_KEY is not set")
+            if not config.pasarguard_base_url:
+                errors.append("PASARGUARD_BASE_URL is not set")
+            if not config.pasarguard_username:
+                errors.append("PASARGUARD_ADMIN_USERNAME is not set")
+            if not config.host_inbound_tag:
+                errors.append("PASARGUARD_HOST_INBOUND_TAG is not set")
+
+            if not config.pasarguard_password:
+                errors.append("PASARGUARD_ADMIN_PASSWORD is not set")
+            if errors:
+                logging.error("Missing configuration:")
+                for e in errors:
+                    logging.error(f"  - {e}")
+                sys.exit(1)
+
+            logging.info("PasarGuard Autoscaler starting...")
+            logging.info(f"  Host inbound tag: {config.host_inbound_tag or '(not set - hosts will not be created)'}")
+            logging.info(f"  Interval: {config.interval}s")
+            logging.info(f"  Min rating: {config.minimum_rating}%")
+            logging.info(f"  Max ping: {config.minimum_ping}ms")
+            logging.info(f"  Max budget: ${config.max_budget}/mo")
+            logging.info(f"  Min nodes: {config.min_nodes}")
+            logging.info(f"  Countries: {config.valid_countries}")
+            logging.info(f"  Datacenters: {config.valid_datacenters or '(any)'}")
+            logging.info(f"  Dry run: {config.dry_run}")
+
+            # ── Load state ──
+            state = _load_state(config.state_file)
+
+
+
             try:
                 asyncio.run(run_one_cycle(config, state))
             except KeyboardInterrupt:
