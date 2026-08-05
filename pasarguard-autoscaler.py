@@ -513,8 +513,8 @@ class NodeProvisioner:
         for attempt in range(1, self.config.max_create_retries + 1):
             logging.info(f"--- VM create attempt {attempt}/{self.config.max_create_retries} ---")
 
-            exclude_dcs = list(state.get("failed_datacenters", {}).keys())
-            plan = self._find_plan(exclude_datacenters=exclude_dcs)
+            # exclude_dcs = list(state.get("failed_datacenters", {}).keys())
+            plan = self._find_plan(exclude_datacenters=[])
             if not plan:
                 logging.warning("No matching Doprax plan found. Giving up.")
                 return None
