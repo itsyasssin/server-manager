@@ -2,15 +2,14 @@
 """
 install_pasarguard_node.py
 
-Connects to a remote server over SSH, installs PasarGuard Node
-(https://github.com/PasarGuard/node) non-interactively, and returns the
-generated API key (API_KEY), SSL certificate, and service port so you can
-register the node with your PasarGuard panel.
+Library utilities to connect over SSH, install PasarGuard Node
+(https://github.com/PasarGuard/node) non-interactively, and return the
+resulting API key, SSL certificate, and service port for panel registration.
 
 Requirements:
     pip install paramiko
 
-Usage (as a library):
+Programmatic usage:
     from install_pasarguard_node import install_node, SSHCredentials
 
     creds = SSHCredentials(host="1.2.3.4", username="root", password="secret")
@@ -18,31 +17,18 @@ Usage (as a library):
     print(result.api_key, result.port)
     print(result.certificate)
 
-Usage (as a CLI):
-    python3 install_pasarguard_node.py --host 1.2.3.4 --username root \\
-        --password secret --name node-eu-1
-
 Notes:
 - The official one-click installer is:
     sudo bash -c "$(curl -sL https://github.com/PasarGuard/scripts/raw/main/pg-node.sh)" @ install
-  The public docs don't document a "-y/--yes" flag for this script, so to
-  guarantee zero interactive prompts we (a) pass --name non-interactively,
-  and (b) pipe "yes" into the installer as a safety net for any prompt it
-  might raise. If you've confirmed the script does support -y/--yes, set
-  extra_install_args=["-y"] and it will be appended to the install command.
-- After install, the node's config lives in a .env file (commonly under
-  /opt/<name> or /var/lib/<name>, depending on install-script version). This
-  script searches common locations rather than hardcoding one path, so it
-  keeps working even if that detail changes upstream.
+- After install, the node's config usually lives in a .env file under
+  /opt/<name> or /var/lib/<name>. This module searches common locations
+  instead of hardcoding one path.
 """
 
 from __future__ import annotations
 
-import argparse
-import getpass
 import re
 import socket
-import sys
 import time
 from dataclasses import dataclass
 from typing import Optional
@@ -288,48 +274,4 @@ def _extract(env_text: str, key: str) -> Optional[str]:
     return match.group(1).strip().strip('"').strip("'")
 
 
-def _cli():
-    parser = argparse.ArgumentParser(description="Install PasarGuard Node over SSH.")
-    parser.add_argument("--host", required=True)
-    parser.add_argument("--ssh-port", type=int, default=22)
-    parser.add_argument("--username", required=True)
-    parser.add_argument("--password", help="If omitted, you'll be prompted (or use --key-file).")
-    parser.add_argument("--key-file", help="Path to a private key file.")
-    parser.add_argument("--key-passphrase")
-    parser.add_argument("--name", help="Node name, for running multiple nodes on one server.")
-    parser.add_argument(
-        "--extra-install-arg",
-        action="append",
-        dest="extra_install_args",
-        help="Extra flag to append to the install command (repeatable), e.g. --extra-install-arg -y",
-    )
-    args = parser.parse_args()
 
-    password = args.password
-    if not password and not args.key_file:
-        password = getpass.getpass(f"SSH password for {args.username}@{args.host}: ")
-
-    creds = SSHCredentials(
-        host=args.host,
-        port=args.ssh_port,
-        username=args.username,
-        password=password,
-        key_filename=args.key_file,
-        key_passphrase=args.key_passphrase,
-    )
-
-    try:
-        result = install_node(creds, node_name=args.name, extra_install_args=args.extra_install_args)
-    except NodeInstallError as e:
-        print(f"Installation failed: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    print("=== PasarGuard Node installed ===")
-    print(f"API_KEY (api_id): {result.api_key}")
-    print(f"PORT: {result.port}")
-    print("CERTIFICATE:")
-    print(result.certificate or "(no SSL_CERT_FILE set / self-managed TLS)")
-
-
-if __name__ == "__main__":
-    _cli()

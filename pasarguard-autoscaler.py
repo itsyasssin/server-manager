@@ -647,16 +647,6 @@ async def pg_disable_node(api, token: str, node_id: int) -> bool:
 # Node naming
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _effective_node_count(nodes: List[Dict], state: Dict) -> int:
-    """Count nodes that should be considered 'active' for MIN_NODES check.
-
-    Enabled nodes from the panel are always counted.  Nodes that were
-    replaced in this session are also counted (the replacement is
-    already enabled in the panel, so this is usually a no-op, but it
-    protects against timing gaps between replace-and-reread).
-    """
-    return len(nodes)
-
 
 def build_node_name(datacenter: str, plan: Dict) -> str:
     """Build node name: datacenter + budget + free traffic.

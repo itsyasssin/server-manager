@@ -1,19 +1,13 @@
 #!/usr/bin/env python3
 """
-check-host-ping-iran.py
+ping.py
 
-Functional Python3 script to ping a host/IP from Iran datacenters
-using the check-host.net API.
-
-Usage:
-    python3 check-host-ping-iran.py <host_or_ip>
-    python3 check-host-ping-iran.py google.com
-    python3 check-host-ping-iran.py 8.8.8.8
+Programmatic helpers to ping a host/IP from Iran datacenters using the
+check-host.net API.
 
 API Reference: https://check-host.net/about/api
 """
 
-import argparse
 import json
 import sys
 import time
@@ -190,30 +184,4 @@ def run(host: str) -> None:
     logging.info(f"{host}: overall_rate: {overall_rate:.1f}% | overall_avg: {avg_str}")
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Ping a host/IP from Iran datacenters via check-host.net API"
-    )
-    parser.add_argument(
-        "host",
-        help="Hostname or IP address to ping (e.g. google.com or 8.8.8.8)",
-    )
-    args = parser.parse_args()
-
-    try:
-        run(args.host)
-    except KeyboardInterrupt:
-        print("\n[!] Interrupted.")
-        sys.exit(130)
-    except urllib.error.URLError as e:
-        print(f"[ERROR] Network error: {e}")
-        sys.exit(1)
-    except Exception as e:
-        print(f"[ERROR] {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()

@@ -1,58 +1,24 @@
 #!/usr/bin/env python3
 """
-doprax-vps-manager.py
+doprax.py
 
-Functional Python3 CLI to manage Doprax VPS instances.
-  - list      : view all VMs (raw JSON)
-  - detail    : get full detail of a single VM (includes IP, access, specs)
-  - catalogue : browse available plans, filter by country/budget
-  - add       : create a VM — auto-picks cheapest plan matching datacenter/country/budget
-  - delete    : delete a VM by service_id
+Programmatic helpers for Doprax VPS management:
+- list and inspect VM instances
+- browse/filter catalogue plans
+- create VMs from matching plans
+- delete VMs directly or by IP lookup
 
-Authentication: DOPRAX_API_KEY env var or --api-key flag.
-  Format: '<prefix>.<secret>'  (set in Doprax dashboard)
+Authentication:
+    DOPRAX API key string in format '<prefix>.<secret>'.
 
-Usage:
-    # List all VMs
-    python3 doprax-vps-manager.py list
-    python3 doprax-vps-manager.py list --search my-server --region ir --status active
-
-    # Full detail of one VM (IP, specs, access info)
-    python3 doprax-vps-manager.py detail --service-id UUID
-
-    # Browse plans
-    python3 doprax-vps-manager.py catalogue
-    python3 doprax-vps-manager.py catalogue --country ir --max-budget-usd 5.0
-
-    # Smart-add: cheapest plan in Iran under $3/mo
-    python3 doprax-vps-manager.py add \
-        --country ir --max-budget-usd 3.0 \
-        --image ubuntu-22.04 --name my-ir-server
-
-    # Smart-add: multiple countries, pick cheapest
-    python3 doprax-vps-manager.py add \
-        --country ir,de,nl --max-budget-usd 5.0 \
-        --image debian-12 --name eu-server
-
-    # Smart-add: specific datacenter
-    python3 doprax-vps-manager.py add \
-        --datacenter ir-thr --max-budget-usd 4.0 --name thr-server
-
-    # Delete a VM
-    python3 doprax-vps-manager.py delete --service-id UUID
-
-    # Delete VM(s) by IP
-    python3 doprax-vps-manager.py delete-by-ip --ip 1.2.3.4
-
-OpenAPI Spec: https://www.doprax.com/reference/api/
+OpenAPI Spec:
+    https://www.doprax.com/reference/api/
 """
 
 from __future__ import annotations
 
-import argparse
 import json
 import logging
-import os
 from random import shuffle
 import sys
 import time
@@ -247,14 +213,6 @@ def _extract_all_options(plan: dict) -> list[tuple[str, dict]]:
     return results
 
 
-def get_plan_locations(plan: dict) -> list[dict]:
-    """Return all location options with their metadata."""
-    locs: list[dict] = []
-    for opt_key, opt in _extract_all_options(plan):
-        if "location" in opt_key.lower() or "region" in opt_key.lower() or "datacenter" in opt_key.lower():
-            locs.append(opt)
-    return locs
-
 
 def get_option_id(opt: dict) -> str | None:
     """Extract the UUID identifier from an allowed_options entry.
@@ -318,16 +276,6 @@ def find_image_option(plan: dict, image_hint: str) -> tuple[str, str, str] | Non
                 continue
             return (opt_key, opt_id, code or label)
     return None
-
-
-def find_image_code(plan: dict, image_hint: str) -> str | None:
-    """Deprecated: kept for backward compatibility. Returns the display code only.
-
-    Use find_image_option() instead when building the 'selections' payload,
-    since the API needs the option's UUID, not this human-readable code.
-    """
-    result = find_image_option(plan, image_hint)
-    return result[2] if result else None
 
 
 def match_plan(plan: dict, countries: list[str] | None,
@@ -714,113 +662,4 @@ def _poll_operation(api_key: str, operation_id: str, max_wait: int = 120) -> Non
     print(f"[!] Timeout after {max_wait}s.")
 
 
-# ── CLI parser ───────────────────────────────────────────────────────────────
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
-        description="Doprax VPS Manager — list, detail, catalogue, add, delete VMs via API",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    p.add_argument("--api-key", default=os.environ.get("DOPRAX_API_KEY"),
-                   help="Doprax API key in form '<prefix>.<secret>' (env: DOPRAX_API_KEY)")
-    p.add_argument("--base-url", default=BASE_URL,
-                   help="Override API base URL")
-
-    sub = p.add_subparsers(dest="command", required=True)
-
-    # ── list ──
-    ls = sub.add_parser("list", help="List all VMs")
-    ls.add_argument("--search", default=None, help="Search by name")
-    ls.add_argument("--region", default=None, help="Filter by region code (query param)")
-    ls.add_argument("--status", default=None, help="Filter by status")
-    ls.add_argument("--service-type", default=None, dest="service_type",
-                    help="Filter by service type (e.g. vm)")
-
-    # ── detail ──
-    dt = sub.add_parser("detail", help="Get full VM detail (IP, specs, access)")
-    dt.add_argument("--service-id", required=True, dest="service_id",
-                    help="Service UUID")
-
-    # ── catalogue ──
-    cat = sub.add_parser("catalogue", help="List available plans")
-    cat.add_argument("--country", default=None,
-                     help="Filter by country code(s), comma-separated (e.g. ir,de,nl)")
-    cat.add_argument("--max-budget-usd", type=float, default=None,
-                     help="Max monthly budget in USD")
-
-    # ── add ──
-    add = sub.add_parser("add", help="Create a VM (smart-select cheapest plan)")
-    add.add_argument("--name", required=True, help="VM name")
-    add.add_argument("--description", default=None, help="VM description")
-    add.add_argument("--country", default=None,
-                     help="Country code(s), comma-separated (e.g. ir,de,nl)")
-    add.add_argument("--datacenter", default=None,
-                     help="Exact datacenter code (e.g. ir-thr)")
-    add.add_argument("--max-budget-usd", type=float, required=True,
-                     help="Maximum monthly budget in USD")
-    add.add_argument("--image", default=None,
-                     help="OS image hint (e.g. ubuntu-22.04, debian-12)")
-    add.add_argument("-y", "--yes", action="store_true",
-                     help="Skip confirmation prompt")
-
-    # ── delete ──
-    rm = sub.add_parser("delete", help="Delete a VM")
-    rm.add_argument("--service-id", required=True, dest="service_id",
-                    help="Service UUID to delete")
-
-    # ── delete-by-ip ──
-    rm_ip = sub.add_parser("delete-by-ip", help="Delete VM(s) by IPv4")
-    rm_ip.add_argument("--ip", required=True, help="IPv4 address to match")
-    rm_ip.add_argument(
-        "--allow-multiple",
-        action="store_true",
-        help="If multiple VMs match this IP, delete all of them (dangerous).",
-    )
-
-    return p
-
-
-# ── Main ────────────────────────────────────────────────────────────────────
-
-COMMAND_MAP = {
-    "list": cmd_list,
-    "detail": cmd_detail,
-    "catalogue": cmd_catalogue,
-    "add": cmd_add,
-    "delete": cmd_delete,
-    "delete-by-ip": cmd_delete_by_ip,
-}
-
-
-def main() -> None:
-    global BASE_URL
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if not args.api_key:
-        print("[ERROR] --api-key or DOPRAX_API_KEY is required")
-        sys.exit(1)
-
-    BASE_URL = args.base_url
-
-    handler = COMMAND_MAP.get(args.command)
-    if handler is None:
-        print(f"[ERROR] Unknown command: {args.command}")
-        sys.exit(1)
-
-    try:
-        handler(args.api_key, args)
-    except urllib.error.HTTPError as e:
-        body = e.read().decode(errors="replace")
-        print(f"[ERROR] HTTP {e.code}: {body}")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print("\nInterrupted.")
-        sys.exit(130)
-    except Exception as e:
-        print(f"[ERROR] {e}")
-        sys.exit(1)
-
-
-if __name__ == "__main__":
-    main()
