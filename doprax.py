@@ -135,7 +135,6 @@ class DopraxClient:
                     continue
 
             except Exception as e:
-                logger.exception("API request failed: %s", e)
                 logger.warning(
                     "get response failed (%d/%d), retrying...",
                     attempt + 1,
