@@ -54,7 +54,7 @@ if MODULES_DIR.exists():
 from ping import PingClient
 
 # doprax.py
-import doprax as _doprax_mod
+from doprax import DopraxClient
 # install_pasarguard_node.py
 from install_pasarguard_node import NodeInstallResult, NodeInstaller, SSHCredentials
 
@@ -110,46 +110,46 @@ class AutoscalerConfig:
     once: bool = False
     state_file: str = ""
 
-
-def _load_env_file(env_path: str) -> dict[str, str]:
-    """Parse a simple KEY=VALUE .env file (no variable expansion)."""
-    result: dict[str, str] = {}
-    if not os.path.isfile(env_path):
+    @staticmethod
+    def _load_env_file(env_path: str) -> dict[str, str]:
+        """Parse a simple KEY=VALUE .env file (no variable expansion)."""
+        result: dict[str, str] = {}
+        if not os.path.isfile(env_path):
+            return result
+        with open(env_path, encoding="utf-8") as fh:
+            for raw_line in fh:
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                result[key.strip()] = val.strip().strip('"').strip("'")
         return result
-    with open(env_path, encoding="utf-8") as fh:
-        for raw_line in fh:
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" not in line:
-                continue
-            key, _, val = line.partition("=")
-            result[key.strip()] = val.strip().strip('"').strip("'")
-    return result
 
+    @staticmethod
+    def _str_list(value: str) -> list[str]:
+        return [x.strip() for x in value.split(",") if x.strip()] if value else []
 
-def _str_list(value: str) -> list[str]:
-    return [x.strip() for x in value.split(",") if x.strip()] if value else []
+    @classmethod
+    def from_env(cls, env_path: str | None = None,
+                 extra: dict[str, str] | None = None) -> "AutoscalerConfig":
+        """Build AutoscalerConfig from .env file + OS environment + optional overrides."""
+        if env_path is None:
+            env_path = str(Path(__file__).resolve().parent / ".env")
 
+        env = cls._load_env_file(env_path)
+        # OS env takes precedence over .env file for matching keys
+        for key, value in os.environ.items():
+            if key in env or key.startswith(("PASARGUARD_", "DOPRAX_")):
+                env[key] = value
+        if extra:
+            env.update(extra)
 
-def build_config(env_path: str | None = None,
-                  extra: dict[str, str] | None = None) -> AutoscalerConfig:
-    """Build AutoscalerConfig from .env file + OS environment + optional overrides."""
-    if env_path is None:
-        env_path = str(Path(__file__).resolve().parent / ".env")
+        g = lambda k, d="": env.get(k, d)
+        state = g("STATE_FILE", str(Path(__file__).resolve().parent / "autoscaler-state.json"))
 
-    env = _load_env_file(env_path)
-    # OS env takes precedence over .env file for matching keys
-    for key, value in os.environ.items():
-        if key in env or key.startswith(("PASARGUARD_", "DOPRAX_")):
-            env[key] = value
-    if extra:
-        env.update(extra)
-
-    g = lambda k, d="": env.get(k, d)
-    state = g("STATE_FILE", str(Path(__file__).resolve().parent / "autoscaler-state.json"))
-
-    return AutoscalerConfig(
+        return cls(
         interval=int(g("INTERVAL", "300")),
         ping_poll_timeout=int(g("PING_POLL_TIMEOUT", "120")),
         vm_ready_timeout=int(g("VM_READY_TIMEOUT", "300")),
@@ -161,8 +161,8 @@ def build_config(env_path: str | None = None,
         max_budget=float(g("MAX_BUDGET", "5")),
         min_nodes=int(g("MIN_NODES", "1")),
         max_create_retries=int(g("MAX_CREATE_RETRIES", "3")),
-        valid_countries=_str_list(g("VALID_COUNTRIES", "ir")),
-        valid_datacenters=_str_list(g("VALID_DATACENTERS", "")),
+        valid_countries=cls._str_list(g("VALID_COUNTRIES", "ir")),
+        valid_datacenters=cls._str_list(g("VALID_DATACENTERS", "")),
         pasarguard_base_url=g("PASARGUARD_BASE_URL"),
         pasarguard_username=g("PASARGUARD_ADMIN_USERNAME"),
         pasarguard_password=g("PASARGUARD_ADMIN_PASSWORD"),
@@ -176,323 +176,6 @@ def build_config(env_path: str | None = None,
         host_inbound_tag=g("PASARGUARD_HOST_INBOUND_TAG", ""),
         state_file=state,
     )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# State persistence (avoids replacing the same node twice, tracks bad DCs)
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Doprax helpers  (programmatic — no argparse)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _doprax_get_plan_traffic(plan: dict) -> str:
-    """Try to extract a human-readable traffic/bandwidth string from a plan.
-
-    Looks in price_components, metadata, and specifications for hints.
-    Returns something like '1TB', '500GB', or 'NA'.
-    """
-    # Check price_components for traffic-related items
-    for pc in (plan.get("price_components") or []):
-        name = (pc.get("name") or "").lower()
-        if any(kw in name for kw in ("traffic", "bandwidth", "transfer", "data")):
-            val = pc.get("value") or pc.get("display_value") or ""
-            if val:
-                return str(val).strip()
-
-    # Check plan metadata / specifications
-    for key in ("bandwidth", "traffic", "transfer", "data_allowance", "network_traffic"):
-        val = plan.get(key) or (plan.get("specifications") or {}).get(key) or (plan.get("metadata") or {}).get(key)
-        if val:
-            return str(val).strip()
-
-    # Check allowed_options metadata
-    for opts in (plan.get("allowed_options") or {}).values():
-        for opt in (opts or []):
-            meta = opt.get("metadata") or {}
-            for mk in ("bandwidth", "traffic", "transfer"):
-                v = meta.get(mk)
-                if v:
-                    return str(v).strip()
-
-    return "NA"
-
-
-def _doprax_get_plan_traffic_bytes(plan: dict) -> int | None:
-    """Parse the plan's traffic/bandwidth string into bytes.
-
-    Handles formats like: '1 TB', '500GB', '1000 GB', 'Unlimited', 'NA', '0'.
-    Returns the integer byte count, or None if unlimited / not parseable.
-    """
-    import re as _re
-
-    raw = _doprax_get_plan_traffic(plan)
-    if not raw or raw.upper() in ("NA", "UNLIMITED", "UNLTD", "INF", "0"):
-        return None
-
-    # Normalise whitespace and case
-    text = raw.strip().upper().replace(" ", "")
-
-    # Regex: optional float + optional space + unit
-    m = _re.match(r"^(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|T|G|M|K|B)?$", text)
-    if not m:
-        logging.debug(f"Could not parse traffic string: '{raw}'")
-        return None
-
-    value = float(m.group(1))
-    unit = (m.group(2) or "B").upper()
-
-    multipliers = {
-        "TB": 1_099_511_627_776, "T": 1_099_511_627_776,
-        "GB": 1_073_741_824,      "G": 1_073_741_824,
-        "MB": 1_048_576,          "M": 1_048_576,
-        "KB": 1_024,             "K": 1_024,
-        "B":  1,
-    }
-    return int(value * multipliers.get(unit, 1))
-
-
-def doprax_find_plan(api_key: str, config: AutoscalerConfig,
-                      exclude_datacenters: list[str] | None = None) -> dict | None:
-    """Find the cheapest matching Doprax plan.
-
-    Returns the raw plan dict or None.
-    """
-    exclude = {d.lower() for d in (exclude_datacenters or [])}
-    exclude = set()
-    max_cents = int(config.max_budget * 100)
-    countries = [c.lower() for c in config.valid_countries]
-    dcs = [d.lower() for d in config.valid_datacenters]
-
-    plans = _doprax_mod.get_catalogue(api_key, service_type="vm")
-    matching = []
-    for p in plans:
-        plan_dc = _doprax_mod.get_plan_datacenter(p).lower()
-        plan_country = _doprax_mod.get_plan_country(p).lower()
-        monthly = _doprax_mod.extract_monthly_price_cents(p)
-
-        # Filter
-        if not monthly or monthly > max_cents:
-            continue
-        if countries and plan_country not in countries:
-            continue
-        if dcs and plan_dc not in dcs:
-            continue
-        if plan_dc in exclude:
-            continue
-
-        matching.append(p)
-
-    if not matching:
-        return None
-
-    shuffle(matching)
-    # matching.sort(key=lambda p: _doprax_mod.extract_monthly_price_cents(p))
-    return matching[0]
-
-
-
-
-def doprax_create_vm(api_key: str, plan: dict, image_hint: str,
-                      name: str) -> tuple[str | None, dict | None]:
-    """Create a Doprax VM and return (service_id, create_response_data).
-
-    Returns (None, None) on failure.
-    """
-    pv_id = plan["product_version_id"]
-    image_opt = _doprax_mod.find_image_option(plan, image_hint)
-    if not image_opt:
-        logging.error(f"No image matching '{image_hint}' in plan")
-        return None, None
-
-    # Build selections: both location AND operating system are chosen this
-    # way, each as {"optionId": "<uuid>"} — NOT via a top-level
-    # 'container_code' or a bare code string.
-    selections: dict[str, dict[str, str]] = {}
-    loc = _doprax_mod.get_plan_location_selection(plan)
-    if loc:
-        loc_key, loc_id = loc
-        selections[loc_key] = {"optionId": loc_id}
-    else:
-        logging.warning("No location option found in plan — VM creation will likely fail.")
-
-    img_key, img_id, _img_display = image_opt
-    selections[img_key] = {"optionId": img_id}
-
-    body: dict[str, Any] = {
-        "product_version_id": pv_id,
-        "idempotency_key": str(_uuid.uuid4()),
-        "name": name,
-        "metadata": {"access_method": "password"},
-    }
-    if selections:
-        body["selections"] = selections
-
-    try:
-        print(body)
-        resp = _doprax_mod.api_request("POST", "/api/v2/services/instances/", api_key, body=body)
-    except Exception as e:
-        logging.error(f"Doprax create VM failed: {e}")
-        return None, None
-
-    data = resp.get("data") or {}
-
-    service_id = (
-        data.get("service_id")
-        or data.get("id")
-        or (data.get("service") or {}).get("id")
-    )
-    if not service_id:
-        logging.error(f"Could not extract service_id from create response: {json.dumps(resp, default=str)}")
-        return None, resp
-
-    return str(service_id), resp
-
-def doprax_wait_vm_ready(api_key: str, service_id: str,
-                          timeout: int = 300, interval: int = 10) -> dict | None:
-    """Poll VM detail until status is active/running.
-
-    Returns the detail response data dict, or None on timeout/failure.
-    """
-    elapsed = 0
-    while elapsed < timeout:
-        try:
-            resp = _doprax_mod.api_request(
-                "GET",
-                f"/api/v2/services/instances/{service_id}/detail/",
-                api_key,
-            )
-            data = resp.get("data") or {}
-
-            # Check various status locations
-            svc_status = (data.get("service") or {}).get("status", "")
-            vm_status = (data.get("vm") or {}).get("status", "")
-            status = svc_status or vm_status or ""
-
-            logging.debug(f"  VM {service_id}: status={status} ({elapsed}s)")
-
-            if status.lower() in ("active", "running", "on"):
-                return data
-
-            if status.lower() in ("failed", "error", "deleted", "suspended"):
-                logging.error(f"VM {service_id} entered bad status: {status}")
-                return None
-
-        except Exception as e:
-            logging.warning(f"  VM poll error: {e}")
-
-        time.sleep(interval)
-        elapsed += interval
-
-    logging.error(f"VM {service_id} not ready after {timeout}s")
-    return None
-
-
-def doprax_extract_access(detail: dict) -> dict | None:
-    """Extract IP, username, password from VM detail.
-
-    Returns {"ip": ..., "username": ..., "password": ...} or None.
-    """
-    vm = detail.get("vm") or {}
-    access = detail.get("access") or {}
-
-    ip = (
-        access.get("public_ipv4")
-        or vm.get("ipv4")
-        or (vm.get("network") or {}).get("ipv4")
-    )
-    username = access.get("username") or vm.get("username") or "root"
-    password = (
-        access.get("password")
-        or access.get("root_password")
-        or vm.get("password")
-        or vm.get("root_password")
-    )
-
-    if not ip:
-        return None
-    if not password:
-        logging.warning(f"No password found for VM {ip}. SSH key auth may be required.")
-
-    return {"ip": ip, "username": username, "password": password}
-
-
-def doprax_delete_vm(api_key: str, service_id: str) -> bool:
-    """Delete a Doprax VM. Returns True on success."""
-    body = {
-        "action": "delete",
-        "idempotency_key": str(_uuid.uuid4()),
-    }
-    try:
-        resp = _doprax_mod.api_request(
-            "POST",
-            f"/api/v2/services/instances/{service_id}/operations/",
-            api_key,
-            body=body,
-        )
-        logging.info(f"Doprax VM {service_id} delete initiated: {resp.get('success')}")
-        return True
-    except Exception as e:
-        logging.error(f"Failed to delete Doprax VM {service_id}: {e}")
-        return False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Ping helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def ping_host(host: str, timeout: int = 120) -> tuple[float, float | None]:
-    """Ping a host from Iran and return (success_rate%, avg_ping_ms).
-
-    avg_ping_ms is None if no successful pings.
-    """
-    client = PingClient(max_wait=timeout)
-
-    iran_nodes = client.get_iran_nodes()
-    if not iran_nodes:
-        logging.error("No Iran check-host nodes available")
-        return 0.0, None
-
-    check_resp = client.submit_ping_check(host, iran_nodes)
-    if not check_resp.get("ok"):
-        logging.error(f"Ping submit failed for {host}: {check_resp}")
-        return 0.0, None
-
-    request_id = check_resp["request_id"]
-    raw = client.poll_until_complete(request_id, len(iran_nodes))
-
-    total_ok, total_pings, avg_ms = PingClient.parse_results(raw)
-    rate = (total_ok / total_pings * 100) if total_pings > 0 else 0.0
-    return rate, avg_ms
-
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Node naming
-# ─────────────────────────────────────────────────────────────────────────────
-
-
-def build_node_name(datacenter: str, plan: dict) -> str:
-    """Build node name: datacenter + budget + free traffic.
-
-    Example: "ir-thr-5usd-1TB"
-    """
-    monthly_cents = _doprax_mod.extract_monthly_price_cents(plan)
-    price_usd = monthly_cents / 100 if monthly_cents else 0
-    traffic = _doprax_get_plan_traffic(plan)
-
-    # Clean up traffic string (extract just the number+unit)
-    traffic_clean = traffic.replace(" ", "").upper()
-    if traffic_clean == "NA" or traffic_clean == "0":
-        traffic_clean = "NA"
-
-    dc = datacenter.replace("_", "-").lower()
-    # echoch time
-    epoch_time = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    return f"automatic - {dc}-${price_usd:g}-{traffic_clean}-{epoch_time}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -535,35 +218,319 @@ class NodeProvisioner:
     ) -> None:
         self.config = config
         self.state_store = state_store
+        self._doprax = DopraxClient(config.doprax_api_key)
+
+    def _delete_vm(self, service_id: str) -> bool:
+        """Delete a Doprax VM. Returns True on success."""
+        body = {
+            "action": "delete",
+            "idempotency_key": str(_uuid.uuid4()),
+        }
+        try:
+            resp = self._doprax.request(
+                "POST",
+                f"/api/v2/services/instances/{service_id}/operations/",
+                body=body,
+            )
+            logging.info(f"Doprax VM {service_id} delete initiated: {resp.get('success')}")
+            return True
+        except Exception as e:
+            logging.error(f"Failed to delete Doprax VM {service_id}: {e}")
+            return False
 
     def _cleanup_failed_vm(self, service_id: str, state: dict[str, Any], dc: str) -> None:
-        _doprax_mod.delete_vm(self.config.doprax_api_key, service_id)
+        self._delete_vm(service_id)
         self.state_store.mark_dc_failed(state, dc)
+
+    @staticmethod
+    def _get_plan_traffic(plan: dict) -> str:
+        """Try to extract a human-readable traffic/bandwidth string from a plan.
+
+        Looks in price_components, metadata, and specifications for hints.
+        Returns something like '1TB', '500GB', or 'NA'.
+        """
+        # Check price_components for traffic-related items
+        for pc in (plan.get("price_components") or []):
+            name = (pc.get("name") or "").lower()
+            if any(kw in name for kw in ("traffic", "bandwidth", "transfer", "data")):
+                val = pc.get("value") or pc.get("display_value") or ""
+                if val:
+                    return str(val).strip()
+
+        # Check plan metadata / specifications
+        for key in ("bandwidth", "traffic", "transfer", "data_allowance", "network_traffic"):
+            val = plan.get(key) or (plan.get("specifications") or {}).get(key) or (plan.get("metadata") or {}).get(key)
+            if val:
+                return str(val).strip()
+
+        # Check allowed_options metadata
+        for opts in (plan.get("allowed_options") or {}).values():
+            for opt in (opts or []):
+                meta = opt.get("metadata") or {}
+                for mk in ("bandwidth", "traffic", "transfer"):
+                    v = meta.get(mk)
+                    if v:
+                        return str(v).strip()
+
+        return "NA"
+
+    @staticmethod
+    def _get_plan_traffic_bytes(plan: dict) -> int | None:
+        """Parse the plan's traffic/bandwidth string into bytes.
+
+        Handles formats like: '1 TB', '500GB', '1000 GB', 'Unlimited', 'NA', '0'.
+        Returns the integer byte count, or None if unlimited / not parseable.
+        """
+        import re as _re
+
+        raw = NodeProvisioner._get_plan_traffic(plan)
+        if not raw or raw.upper() in ("NA", "UNLIMITED", "UNLTD", "INF", "0"):
+            return None
+
+        # Normalise whitespace and case
+        text = raw.strip().upper().replace(" ", "")
+
+        # Regex: optional float + optional space + unit
+        m = _re.match(r"^(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|T|G|M|K|B)?$", text)
+        if not m:
+            logging.debug(f"Could not parse traffic string: '{raw}'")
+            return None
+
+        value = float(m.group(1))
+        unit = (m.group(2) or "B").upper()
+
+        multipliers = {
+            "TB": 1_099_511_627_776, "T": 1_099_511_627_776,
+            "GB": 1_073_741_824,      "G": 1_073_741_824,
+            "MB": 1_048_576,          "M": 1_048_576,
+            "KB": 1_024,             "K": 1_024,
+            "B":  1,
+        }
+        return int(value * multipliers.get(unit, 1))
+
+    def _find_plan(self, exclude_datacenters: list[str] | None = None) -> dict | None:
+        """Find the cheapest matching Doprax plan.
+
+        Returns the raw plan dict or None.
+        """
+        exclude = {d.lower() for d in (exclude_datacenters or [])}
+        max_cents = int(self.config.max_budget * 100)
+        countries = [c.lower() for c in self.config.valid_countries]
+        dcs = [d.lower() for d in self.config.valid_datacenters]
+
+        plans = self._doprax.get_catalogue(service_type="vm")
+        matching = []
+        for p in plans:
+            plan_dc = DopraxClient.get_plan_datacenter(p).lower()
+            plan_country = DopraxClient.get_plan_country(p).lower()
+            monthly = DopraxClient.extract_monthly_price_cents(p)
+
+            # Filter
+            if not monthly or monthly > max_cents:
+                continue
+            if countries and plan_country not in countries:
+                continue
+            if dcs and plan_dc not in dcs:
+                continue
+            if plan_dc in exclude:
+                continue
+
+            matching.append(p)
+
+        if not matching:
+            return None
+
+        shuffle(matching)
+        # matching.sort(key=lambda p: DopraxClient.extract_monthly_price_cents(p))
+        return matching[0]
+
+    def _create_vm(self, plan: dict, name: str) -> tuple[str | None, dict | None]:
+        """Create a Doprax VM and return (service_id, create_response_data).
+
+        Returns (None, None) on failure.
+        """
+        pv_id = plan["product_version_id"]
+        image_opt = DopraxClient.find_image_option(plan, self.config.doprax_image)
+        if not image_opt:
+            logging.error(f"No image matching '{self.config.doprax_image}' in plan")
+            return None, None
+
+        # Build selections: both location AND operating system are chosen this
+        # way, each as {"optionId": "<uuid>"} — NOT via a top-level
+        # 'container_code' or a bare code string.
+        selections: dict[str, dict[str, str]] = {}
+        loc = DopraxClient.get_plan_location_selection(plan)
+        if loc:
+            loc_key, loc_id = loc
+            selections[loc_key] = {"optionId": loc_id}
+        else:
+            logging.warning("No location option found in plan — VM creation will likely fail.")
+
+        img_key, img_id, _img_display = image_opt
+        selections[img_key] = {"optionId": img_id}
+
+        body: dict[str, Any] = {
+            "product_version_id": pv_id,
+            "idempotency_key": str(_uuid.uuid4()),
+            "name": name,
+            "metadata": {"access_method": "password"},
+        }
+        if selections:
+            body["selections"] = selections
+
+        try:
+            print(body)
+            resp = self._doprax.request("POST", "/api/v2/services/instances/", body=body)
+        except Exception as e:
+            logging.error(f"Doprax create VM failed: {e}")
+            return None, None
+
+        data = resp.get("data") or {}
+
+        service_id = (
+            data.get("service_id")
+            or data.get("id")
+            or (data.get("service") or {}).get("id")
+        )
+        if not service_id:
+            logging.error(f"Could not extract service_id from create response: {json.dumps(resp, default=str)}")
+            return None, resp
+
+        return str(service_id), resp
+
+    def _wait_vm_ready(self, service_id: str) -> dict | None:
+        """Poll VM detail until status is active/running.
+
+        Returns the detail response data dict, or None on timeout/failure.
+        """
+        timeout = self.config.vm_ready_timeout
+        interval = self.config.vm_ready_poll_interval
+        elapsed = 0
+        while elapsed < timeout:
+            try:
+                resp = self._doprax.request(
+                    "GET",
+                    f"/api/v2/services/instances/{service_id}/detail/",
+                )
+                data = resp.get("data") or {}
+
+                # Check various status locations
+                svc_status = (data.get("service") or {}).get("status", "")
+                vm_status = (data.get("vm") or {}).get("status", "")
+                status = svc_status or vm_status or ""
+
+                logging.debug(f"  VM {service_id}: status={status} ({elapsed}s)")
+
+                if status.lower() in ("active", "running", "on"):
+                    return data
+
+                if status.lower() in ("failed", "error", "deleted", "suspended"):
+                    logging.error(f"VM {service_id} entered bad status: {status}")
+                    return None
+
+            except Exception as e:
+                logging.warning(f"  VM poll error: {e}")
+
+            time.sleep(interval)
+            elapsed += interval
+
+        logging.error(f"VM {service_id} not ready after {timeout}s")
+        return None
+
+    @staticmethod
+    def _extract_access(detail: dict) -> dict | None:
+        """Extract IP, username, password from VM detail.
+
+        Returns {"ip": ..., "username": ..., "password": ...} or None.
+        """
+        vm = detail.get("vm") or {}
+        access = detail.get("access") or {}
+
+        ip = (
+            access.get("public_ipv4")
+            or vm.get("ipv4")
+            or (vm.get("network") or {}).get("ipv4")
+        )
+        username = access.get("username") or vm.get("username") or "root"
+        password = (
+            access.get("password")
+            or access.get("root_password")
+            or vm.get("password")
+            or vm.get("root_password")
+        )
+
+        if not ip:
+            return None
+        if not password:
+            logging.warning(f"No password found for VM {ip}. SSH key auth may be required.")
+
+        return {"ip": ip, "username": username, "password": password}
+
+    def _ping(self, host: str) -> tuple[float, float | None]:
+        """Ping a host from Iran and return (success_rate%, avg_ping_ms).
+
+        avg_ping_ms is None if no successful pings.
+        """
+        client = PingClient(max_wait=self.config.ping_poll_timeout)
+
+        iran_nodes = client.get_iran_nodes()
+        if not iran_nodes:
+            logging.error("No Iran check-host nodes available")
+            return 0.0, None
+
+        check_resp = client.submit_ping_check(host, iran_nodes)
+        if not check_resp.get("ok"):
+            logging.error(f"Ping submit failed for {host}: {check_resp}")
+            return 0.0, None
+
+        request_id = check_resp["request_id"]
+        raw = client.poll_until_complete(request_id, len(iran_nodes))
+
+        total_ok, total_pings, avg_ms = PingClient.parse_results(raw)
+        rate = (total_ok / total_pings * 100) if total_pings > 0 else 0.0
+        return rate, avg_ms
+
+    @staticmethod
+    def _build_node_name(datacenter: str, plan: dict) -> str:
+        """Build node name: datacenter + budget + free traffic.
+
+        Example: "ir-thr-5usd-1TB"
+        """
+        monthly_cents = DopraxClient.extract_monthly_price_cents(plan)
+        price_usd = monthly_cents / 100 if monthly_cents else 0
+        traffic = NodeProvisioner._get_plan_traffic(plan)
+
+        # Clean up traffic string (extract just the number+unit)
+        traffic_clean = traffic.replace(" ", "").upper()
+        if traffic_clean == "NA" or traffic_clean == "0":
+            traffic_clean = "NA"
+
+        dc = datacenter.replace("_", "-").lower()
+        epoch_time = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+        return f"automatic - {dc}-${price_usd:g}-{traffic_clean}-{epoch_time}"
 
     def create_validated_vm(self, state: dict[str, Any]) -> dict[str, Any] | None:
         for attempt in range(1, self.config.max_create_retries + 1):
             logging.info(f"--- VM create attempt {attempt}/{self.config.max_create_retries} ---")
 
             exclude_dcs = list(state.get("failed_datacenters", {}).keys())
-            plan = doprax_find_plan(self.config.doprax_api_key, self.config, exclude_datacenters=exclude_dcs)
+            plan = self._find_plan(exclude_datacenters=exclude_dcs)
             if not plan:
                 logging.warning("No matching Doprax plan found. Giving up.")
                 return None
 
-            dc = _doprax_mod.get_plan_datacenter(plan)
-            monthly_cents = _doprax_mod.extract_monthly_price_cents(plan)
-            new_node_name = build_node_name(dc, plan)
+            dc = DopraxClient.get_plan_datacenter(plan)
+            monthly_cents = DopraxClient.extract_monthly_price_cents(plan)
+            new_node_name = self._build_node_name(dc, plan)
             logging.info(
                 f"Selected plan: dc={dc}, ${monthly_cents/100:.2f}/mo, "
-                f"traffic={_doprax_get_plan_traffic(plan)}, name='{new_node_name}'"
+                f"traffic={self._get_plan_traffic(plan)}, name='{new_node_name}'"
             )
 
             service_id = None
             try:
-                service_id, create_resp = doprax_create_vm(
-                    self.config.doprax_api_key,
+                service_id, create_resp = self._create_vm(
                     plan,
-                    self.config.doprax_image,
                     new_node_name,
                 )
                 if not service_id:
@@ -574,20 +541,15 @@ class NodeProvisioner:
                 create_data = (create_resp or {}).get("data") or {}
                 op_id = create_data.get("operation_id")
                 if op_id:
-                    _doprax_mod._poll_operation(self.config.doprax_api_key, op_id, max_wait=self.config.vm_ready_timeout)
+                    self._doprax._poll_operation(op_id, max_wait=self.config.vm_ready_timeout)
 
-                detail = doprax_wait_vm_ready(
-                    self.config.doprax_api_key,
-                    service_id,
-                    timeout=self.config.vm_ready_timeout,
-                    interval=self.config.vm_ready_poll_interval,
-                )
+                detail = self._wait_vm_ready(service_id)
                 if not detail:
                     logging.error(f"VM {service_id} did not become active. Cleaning up and retrying...")
                     self._cleanup_failed_vm(service_id, state, dc)
                     continue
 
-                access = doprax_extract_access(detail)
+                access = self._extract_access(detail)
                 if not access or not access["ip"]:
                     logging.error(f"Could not extract access info for VM {service_id}. Cleaning up and retrying...")
                     self._cleanup_failed_vm(service_id, state, dc)
@@ -599,7 +561,7 @@ class NodeProvisioner:
                     (detail.get("vm") or {}).get("vm_code", "")
                     or (detail.get("links") or {}).get("vm_code", "")
                 )
-                new_pass = _doprax_mod.get_password(self.config.doprax_api_key, vm_code)
+                new_pass = self._doprax.get_password(vm_code)
                 if not new_pass:
                     logging.error(f"Could not get password for VM {service_id}. Cleaning up and retrying...")
                     self._cleanup_failed_vm(service_id, state, dc)
@@ -607,7 +569,7 @@ class NodeProvisioner:
                 logging.info(f"VM ready: {new_user}@{new_ip}")
 
                 logging.info(f"Pinging new VM {new_ip} from Iran...")
-                rate, avg_ms = ping_host(new_ip, timeout=self.config.ping_poll_timeout)
+                rate, avg_ms = self._ping(new_ip)
                 logging.info(
                     f"New VM ping results: rate={rate:.1f}%, avg={avg_ms:.1f}ms"
                     if avg_ms else f"rate={rate:.1f}%, avg=N/A"
@@ -646,7 +608,7 @@ class NodeProvisioner:
         new_user = vm_info["new_user"]
         new_pass = vm_info["new_pass"]
         new_node_name = vm_info["new_node_name"]
-        traffic_bytes = _doprax_get_plan_traffic_bytes(plan)
+        traffic_bytes = self._get_plan_traffic_bytes(plan)
 
         logging.info(f"Installing PasarGuard node on {new_user}@{new_ip}...")
         creds = SSHCredentials(host=new_ip, username=new_user, password=new_pass)
@@ -655,7 +617,7 @@ class NodeProvisioner:
             install_result: NodeInstallResult = installer.install_node(creds)
         except Exception as e:
             logging.exception(f"PasarGuard node install failed: {e}")
-            _doprax_mod.delete_vm(self.config.doprax_api_key, service_id)
+            self._delete_vm(service_id)
             return False, None
 
         logging.info(
@@ -686,10 +648,10 @@ class NodeProvisioner:
         )
         if not new_pg_node_id:
             logging.error("Failed to add new node to PasarGuard panel. Aborting.")
-            _doprax_mod.delete_vm(self.config.doprax_api_key, service_id)
+            self._delete_vm(service_id)
             return False, None
 
-        country = _doprax_mod.get_plan_country(plan, flag=True)
+        country = DopraxClient.get_plan_country(plan, flag=True)
         if country and self.config.host_inbound_tag:
             tags = self.config.host_inbound_tag.split(",")
             for t in tags:
@@ -789,6 +751,7 @@ class Autoscaler:
         self.config = config
         self.state_store = state_store
         self.provisioner = provisioner
+        self._doprax = DopraxClient(config.doprax_api_key)
 
     async def run_one_cycle(self, state: dict[str, Any]) -> None:
         cycle_start = datetime.now(timezone.utc)
@@ -853,7 +816,7 @@ class Autoscaler:
 
             logging.info(f"Pinging node '{nname}' ({addr})...")
             try:
-                rate, avg_ms = ping_host(addr, timeout=self.config.ping_poll_timeout)
+                rate, avg_ms = self.provisioner._ping(addr)
             except Exception as e:
                 logging.error(f"Ping error for {addr}: {e}")
                 rate, avg_ms = 0.0, None
@@ -888,7 +851,7 @@ class Autoscaler:
 
             if success:
                 await pg_client.purge_by_ip(addr)
-                _doprax_mod.delete_vm_by_ip(self.config.doprax_api_key, addr)
+                self._doprax.delete_vm_by_ip(addr)
             else:
                 state["stats"]["failures"] = state["stats"].get("failures", 0) + 1
 
@@ -941,7 +904,7 @@ class AutoscalerApp:
     def run(self) -> None:
         try:
             while True:
-                config = build_config(env_path=self.env_path)
+                config = AutoscalerConfig.from_env(env_path=self.env_path)
                 config.once = config.once or self.once
 
                 self._validate_config(config)

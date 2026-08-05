@@ -239,4 +239,3 @@ def _coerce_addresses(value: Any) -> list[str]:
             out.append(str(x))
         return out
     return [str(value)]
-
