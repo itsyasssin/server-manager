@@ -17,16 +17,14 @@ OpenAPI Spec:
 
 from __future__ import annotations
 
-import json
 import logging
-from random import shuffle
-import sys
 import time
-import urllib.request
-import urllib.error
-import urllib.parse
-import requests
 import uuid as _uuid
+from random import shuffle
+
+import requests
+
+logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
@@ -103,15 +101,14 @@ def api_request(
             resp.raise_for_status()
 
             try:
-
                 return resp.json()
-            except requests.JSONDecodeError:
-                logging.warning(
+            except ValueError:
+                logger.warning(
                     "JSON decode failed (%d/%d), retrying...",
                     attempt + 1,
                     max_attempts,
                 )
-                logging.debug(resp.text)
+                logger.debug(resp.text)
 
                 if attempt == max_attempts - 1:
                     return {}
@@ -119,10 +116,9 @@ def api_request(
                 time.sleep(1)
                 continue
 
-        except:
-            logging.exception("trackback",
-            )
-            logging.warning(
+        except Exception:
+            logger.exception("trackback")
+            logger.warning(
                 "get response failed (%d/%d), retrying...",
                 attempt + 1,
                 max_attempts,
@@ -133,7 +129,7 @@ def api_request(
 
             time.sleep(1)
 
-    # return {}
+    return {}
 
 def _all_pages(api_key: str, path: str,
                query: dict | None = None) -> tuple[list[dict], dict]:
@@ -278,101 +274,10 @@ def find_image_option(plan: dict, image_hint: str) -> tuple[str, str, str] | Non
     return None
 
 
-def match_plan(plan: dict, countries: list[str] | None,
-               datacenter: str | None, max_budget_cents: int | None) -> bool:
-    """Check if a plan matches all given filters."""
-    if datacenter:
-        plan_dc = get_plan_datacenter(plan)
-        if plan_dc.lower() != datacenter.lower():
-            return False
-
-    if countries:
-        plan_country = get_plan_country(plan)
-        if plan_country not in [c.lower() for c in countries]:
-            return False
-
-    if max_budget_cents is not None:
-        monthly = extract_monthly_price_cents(plan)
-        if monthly > max_budget_cents:
-            return False
-
-    return True
 
 
-# ── Commands ─────────────────────────────────────────────────────────────────
+# ── Catalogue and VM helpers ────────────────────────────────────────────────
 
-def cmd_list(api_key: str, args) -> None:
-    """List all VM instances.
-
-    GET /api/v2/services/instances/list/
-    Query: page, page_size, search, region, status, service_type, provider,
-           sort_by, sort_dir, date_from, date_to
-    Response: { success, data: [ServiceSummarySchema], meta: ServiceMetaSchema }
-    """
-    query: dict = {}
-    if args.search:
-        query["search"] = args.search
-    if args.region:
-        query["region"] = args.region
-    if args.status:
-        query["status"] = args.status
-    if args.service_type:
-        query["service_type"] = args.service_type
-
-    vms, meta = _all_pages(api_key, "/api/v2/services/instances/list/", query)
-
-    result = {
-        "total": meta.get("total", 0),
-        "active_total": meta.get("active_total", 0),
-        "vms": vms,
-    }
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-
-
-def cmd_detail(api_key: str, args) -> None:
-    """Get full VM detail including IP, specs, access info.
-
-    GET /api/v2/services/instances/{service_id}/detail/
-    Response: { success, data: ServiceDetailDataSchema }
-      data.service  — ServiceSummarySchema
-      data.vm       — VMDataSchema (id, name, cpu, ram_gb, ssd_gb, ipv4, ipv6, country, location_name, os_name, ...)
-      data.access   — ServiceAccessSchema (username, public_ipv4, public_ipv6, active_ssh_key, ...)
-      data.selections, data.dimensions, data.price_components, data.links
-    """
-    sid = args.service_id
-    resp = api_request("GET", f"/api/v2/services/instances/{sid}/detail/", api_key)
-    print(json.dumps(resp, indent=2, ensure_ascii=False))
-
-
-def cmd_catalogue(api_key: str, args) -> None:
-    """List available plans, optionally filtered by country and budget.
-
-    GET /api/v2/catalogue/service-catalogue/
-    """
-    plans = get_catalogue(api_key)
-
-    countries = [c.strip() for c in args.country.split(",")] if args.country else None
-    max_cents = int(args.max_budget_usd * 100) if args.max_budget_usd is not None else None
-
-    filtered = []
-    for plan in plans:
-        if not match_plan(plan, countries, None, max_cents):
-            continue
-        monthly = extract_monthly_price_cents(plan)
-        filtered.append({
-            "product_version_id": plan.get("product_version_id"),
-            "plan_name": plan.get("product", {}).get("name"),
-            "service_type": plan.get("product", {}).get("service_type"),
-            "provider": plan.get("provider", {}).get("name"),
-            "provider_code": plan.get("provider", {}).get("code"),
-            "country": get_plan_country(plan),
-            "datacenter": get_plan_datacenter(plan),
-            "monthly_price_usd": round(monthly / 100, 2) if monthly else None,
-            "currency": plan.get("currency"),
-        })
-
-    filtered.sort(key=lambda x: x["monthly_price_usd"] or 999999)
-    print(json.dumps(filtered, indent=2, ensure_ascii=False))
 
 
 def get_plan_location_selection(plan: dict) -> tuple[str, str] | None:
@@ -392,114 +297,6 @@ def get_plan_location_selection(plan: dict) -> tuple[str, str] | None:
     shuffle(all_location)
     return all_location[0] if all_location else None
 
-def cmd_add(api_key: str, args) -> None:
-    """Smart-add: find the cheapest matching plan and create a VM.
-
-    POST /api/v2/services/instances/
-    Body (ServiceCreateRequestSchemaRequest):
-      Required: product_version_id (uuid), idempotency_key
-      Optional: name, description, metadata, selections, image, container_code,
-                container_codes, container_id, container_ids, app_name, container_name
-    """
-    countries = [c.strip() for c in args.country.split(",")] if args.country else None
-    max_cents = int(args.max_budget_usd * 100) if args.max_budget_usd is not None else None
-
-    # 1. Fetch catalogue
-    print("[*] Fetching catalogue ...")
-    plans = get_catalogue(api_key)
-
-    # 2. Filter matching plans
-    matching = [
-        p for p in plans
-        if match_plan(p, countries, args.datacenter, max_cents)
-    ]
-
-    if not matching:
-        print("[ERROR] No plans match your filters.")
-        print(f"  Countries : {countries or 'any'}")
-        print(f"  Datacenter: {args.datacenter or 'any'}")
-        print(f"  Max budget: ${args.max_budget_usd}/mo")
-        sys.exit(1)
-
-    # 3. Sort by monthly price (cheapest first)
-    matching.sort(key=lambda p: extract_monthly_price_cents(p))
-
-    # 4. Find first plan with a matching OS image (if --image given)
-    chosen_plan = None
-    chosen_image_option = None  # (opt_key, option_id, display_code)
-
-    for plan in matching:
-        if args.image:
-            img_opt = find_image_option(plan, args.image)
-            if not img_opt:
-                continue
-            chosen_image_option = img_opt
-        chosen_plan = plan
-        break
-
-    if not chosen_plan:
-        print(f"[ERROR] No plan has an image matching '{args.image}'")
-        sys.exit(1)
-
-    pv_id = chosen_plan["product_version_id"]
-    monthly = extract_monthly_price_cents(chosen_plan)
-    provider = chosen_plan.get("provider", {}).get("name", "?")
-    plan_name = chosen_plan.get("product", {}).get("name", "?")
-    dc = get_plan_datacenter(chosen_plan)
-
-    print(f"[+] Best match:")
-    print(f"    Plan      : {plan_name}")
-    print(f"    Provider  : {provider}")
-    print(f"    Datacenter: {dc or '(unknown)'}")
-    print(f"    Price     : ${monthly / 100:.2f}/mo")
-    if chosen_image_option:
-        print(f"    Image     : {chosen_image_option[2]}")
-
-    if not args.yes:
-        confirm = input("\n[?] Create this VM? [y/N] ").strip().lower()
-        if confirm != "y":
-            print("Aborted.")
-            sys.exit(0)
-
-    # 5. Build create request per OpenAPI spec.
-    # NOTE: both location AND operating system are chosen via 'selections',
-    # each as {"optionId": "<uuid>"} — NOT via a top-level 'container_code'
-    # or a bare code string.
-    body: dict = {
-        "product_version_id": pv_id,
-        "idempotency_key": str(_uuid.uuid4()),
-        "name": args.name,
-        "metadata": {"access_method": "password"},
-    }
-    if args.description:
-        body["description"] = args.description
-
-    selections: dict = {}
-
-    loc = get_plan_location_selection(chosen_plan)
-    if loc:
-        opt_key, opt_id = loc
-        selections[opt_key] = {"optionId": opt_id}
-    else:
-        print("[WARNING] No location option found in plan — VM creation will likely fail.")
-
-    if chosen_image_option:
-        opt_key, opt_id, _display = chosen_image_option
-        selections[opt_key] = {"optionId": opt_id}
-
-    if selections:
-        body["selections"] = selections
-
-    print(f"\n[*] Creating VM '{args.name}' ...")
-    resp = api_request("POST", "/api/v2/services/instances/", api_key, body=body)
-    print(json.dumps(resp, indent=2, ensure_ascii=False))
-
-    # 6. Poll the async operation if one was returned
-    data = resp.get("data")
-    if data and data.get("operation_id"):
-        op_id = data["operation_id"]
-        print(f"\n[*] Operation {op_id} — polling status ...")
-        _poll_operation(api_key, op_id)
 
 
 def delete_vm(api_key: str, service_id: str) -> dict:
@@ -602,29 +399,6 @@ def delete_vm_by_ip(api_key: str, ip: str, *, require_unique: bool = True) -> di
     return summary
 
 
-def cmd_delete_by_ip(api_key: str, args) -> None:
-    """Delete a VM by IP address."""
-    result = delete_vm_by_ip(api_key, args.ip, require_unique=not args.allow_multiple)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-
-
-def cmd_delete(api_key: str, args) -> None:
-    """Delete a VM by issuing the 'delete' lifecycle action.
-
-    POST /api/v2/services/instances/{service_id}/operations/
-    Body (ServiceActionRequestSchemaRequest):
-      Required: action (non-empty), idempotency_key (non-empty)
-      Optional: ip_version, container_code, container_codes, container_id, container_ids
-    """
-    service_id = args.service_id
-
-    print(f"[*] Deleting VM {service_id} ...")
-    resp = delete_vm(api_key, service_id)
-    print(json.dumps(resp, indent=2, ensure_ascii=False))
-
-    data = resp.get("data")
-    if data and data.get("operation_id"):
-        _poll_operation(api_key, data["operation_id"])
 
 
 # ── Operation polling ────────────────────────────────────────────────────────
