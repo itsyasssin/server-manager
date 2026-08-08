@@ -42,6 +42,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from random import shuffle
 from typing import Any
+from zoneinfo import ZoneInfo
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Module path setup — import the 4 companion modules from ../upload/
@@ -492,10 +493,6 @@ class NodeProvisioner:
 
     @staticmethod
     def _build_node_name(datacenter: str, plan: dict) -> str:
-        """Build node name: datacenter + budget + free traffic.
-
-        Example: "ir-thr-5usd-1TB"
-        """
         monthly_cents = DopraxClient.extract_monthly_price_cents(plan)
         price_usd = monthly_cents / 100 if monthly_cents else 0
         traffic = NodeProvisioner._get_plan_traffic(plan)
@@ -503,11 +500,11 @@ class NodeProvisioner:
         # Clean up traffic string (extract just the number+unit)
         traffic_clean = traffic.replace(" ", "").upper()
         if traffic_clean == "NA" or traffic_clean == "0":
-            traffic_clean = "NA"
+            traffic_clean = ""
 
         dc = datacenter.replace("_", "-").lower()
-        epoch_time = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-        return f"automatic - {dc}-${price_usd:g}-{traffic_clean}-{epoch_time}"
+        epoch_time = datetime.now(ZoneInfo("Asia/Tehran")).strftime("%b %d %H:%M")
+        return f"> {dc}-${price_usd:g}{traffic_clean}-{epoch_time}"
 
     def create_validated_vm(self, state: dict[str, Any]) -> dict[str, Any] | None:
         for attempt in range(1, self.config.max_create_retries + 1):
